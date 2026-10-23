@@ -1,820 +1,658 @@
-import express from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
-import dotenv from 'dotenv';
-import multer from 'multer';
-import path from 'path';
-import { parse } from 'csv-parse/sync';
-import { stringify } from 'csv-stringify/sync';
-import crypto from 'crypto';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import db, { dbReady, get, all, run, exec } from './db.js';
-import { JWT_SECRET, JWT_EXPIRES_IN, JWT_ALGORITHM, avisarSenhasSeedPadrao } from './config.js';
-import { requireAuth, requireAdmin, ehAdmin } from './middleware/auth.js';
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import multer from "multer";
+import { parse } from "csv-parse/sync";
+import { stringify } from "csv-stringify/sync";
+import crypto from "crypto";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import db, { get, all, run, exec } from "./db.js";
+import { JWT_SECRET, JWT_EXPIRES_IN } from "./config.js";
+import { requireAuth, requireAdmin } from "./middleware/auth.js";
 
 dotenv.config();
 
 const app = express();
 
-const isDev = process.env.NODE_ENV !== 'production';
-const isProd = process.env.NODE_ENV === 'production';
+const isDev = process.env.NODE_ENV !== "production";
 const localOriginRegex = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 
-// Tabelas e colunas usadas pelas rotas de backup. Declaradas aqui no topo
-// porque o fileFilter do multer precisa da allowlist de tabelas.
-// auditoria_lavagens entra na lista de propósito: ela é uma tabela de dados
-// como as demais, e ficar fora quebrava dois controles ao mesmo tempo — o
-// reset a deixava viva com registros de lavagens apagadas, e o export a
-// deixava de fora, perdendo a trilha de auditoria a cada restore.
-const tables = ['users', 'clientes', 'veiculos', 'tipos_lavagem', 'lavagens', 'produtos', 'movimentacoes', 'auditoria_lavagens'];
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Permite requisições sem header Origin
+      if (!origin) return callback(null, true);
 
-// Erro de origem bloqueada, com status próprio para o error handler devolver
-// 403 limpo em vez de cair no handler default do Express (que responderia 500
-// com stack trace fora de produção).
-class CorsError extends Error {
-  constructor(origin) {
-    super(`Bloqueado pelo CORS: ${origin}`);
-    this.name = 'CorsError';
-    this.status = 403;
-    this.clientMessage = 'Origem não permitida.';
-  }
-}
+      if (isDev && localOriginRegex.test(origin)) {
+        return callback(null, true);
+      }
 
-class UploadRejeitado extends Error {
-  constructor(nomeArquivo) {
-    super(`Arquivo não permitido no backup: ${nomeArquivo}`);
-    this.name = 'UploadRejeitado';
-    this.status = 400;
-    this.clientMessage = `Arquivo não permitido: ${nomeArquivo}. Envie apenas os CSVs gerados pelo export.`;
-  }
-}
+      const allowedOrigin = process.env.FRONTEND_URL || "http://localhost:8081";
+      if (origin === allowedOrigin) {
+        return callback(null, true);
+      }
 
-// FRONTEND_URL é obrigatório em produção: sem ele a política de CORS cairia
-// silenciosamente para localhost e o deploy pareceria uma falha de rede.
-const FRONTEND_ORIGIN = process.env.FRONTEND_URL || (isProd ? null : 'http://localhost:8080');
-if (isProd && !FRONTEND_ORIGIN) {
-  throw new Error('FRONTEND_URL é obrigatório em produção para definir a política de CORS.');
-}
-
-// Confia no primeiro proxy (nginx, Vercel) para que o rate limit enxergue o IP
-// real do cliente — sem isso todos os usuários dividem o mesmo contador.
-app.set('trust proxy', 1);
-app.disable('x-powered-by');
-
-// Headers de segurança: anti-clickjacking, anti-MIME-sniffing e CSP restritiva.
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      // O Recharts injeta um <style> dinâmico (frontend/src/components/ui/chart.tsx),
-      // cujos valores passam por uma allowlist de cores no próprio componente.
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
-      imgSrc: ["'self'", 'data:'],
-      connectSrc: ["'self'", FRONTEND_ORIGIN].filter(Boolean),
-      objectSrc: ["'none'"],
-      frameAncestors: ["'none'"],
-      baseUri: ["'self'"],
-      formAction: ["'self'"],
-      upgradeInsecureRequests: isProd ? [] : null,
+      return callback(new Error(`Bloqueado pelo CORS: ${origin}`));
     },
-  },
-  crossOriginResourcePolicy: { policy: 'same-site' },
-  referrerPolicy: { policy: 'no-referrer' },
-  hsts: isProd ? { maxAge: 31536000, includeSubDomains: true } : false,
-}));
-app.use(helmet.noSniff());
-app.use(helmet.frameguard({ action: 'deny' }));
+    credentials: true,
+  }),
+);
 
-app.use(cors({
-  origin: (origin, callback) => {
-    // Requisição sem header Origin: same-origin, proxy do Vite e ferramentas
-    // locais. Bloqueada em produção para fechar o vetor de CSRF caso o token
-    // venha a migrar para cookie.
-    if (!origin) return callback(null, !isProd);
+app.use(express.json());
 
-    if (isDev && localOriginRegex.test(origin)) {
-      return callback(null, true);
-    }
-    if (origin === FRONTEND_ORIGIN) {
-      return callback(null, true);
-    }
-
-    return callback(new CorsError(origin));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  maxAge: 86400,
-}));
-
-// Limite explícito de corpo: evita que um payload grande consuma memória do
-// processo antes de qualquer validação.
-app.use(express.json({ limit: '200kb' }));
-
-// Teto geral de requisições por IP, para que nenhum cliente monopolize o
-// event loop single-threaded do Node.
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 300,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Muitas requisições. Aguarde um momento e tente novamente.' },
-});
-
-// Limite estrito no login: sem ele o único freio contra força bruta seria o
-// custo do bcrypt (~80ms), o que permite milhares de tentativas por minuto.
-// skipSuccessfulRequests garante que o uso legítimo não consuma a cota.
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipSuccessfulRequests: true,
-  message: { error: 'Muitas tentativas de login. Tente novamente em alguns minutos.' },
-});
-
-app.use('/api', apiLimiter);
-
-// Nota sobre isolamento por usuário: este é um sistema de um único lava-rápido,
-// não multi-tenant. Toda a equipe autenticada (admin e operadores) compartilha
-// intencionalmente a mesma base de clientes/veículos/lavagens/produtos — por
-// isso as rotas GET não filtram por user_id. O que É garantido é que nenhuma
-// rota confia em um user_id vindo do cliente: toda gravação usa req.user.id,
-// extraído do token JWT validado pelo middleware requireAuth.
-
-// memoryStorage sem limites permitiria que um único upload carregasse
-// gigabytes na RAM e derrubasse o processo por OOM.
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 5 * 1024 * 1024,   // 5 MB por CSV
-    files: tables.length,        // no máximo um arquivo por tabela
-    fields: 0,                   // nenhum campo de texto é esperado
-  },
-  fileFilter: (req, file, cb) => {
-    const nome = file.originalname || '';
-    const base = path.basename(nome, path.extname(nome));
-    if (!nome.toLowerCase().endsWith('.csv') || !tables.includes(base)) {
-      return cb(new UploadRejeitado(nome));
-    }
-    cb(null, true);
-  },
-});
-
+const upload = multer({ storage: multer.memoryStorage() });
 const genId = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
+const publicUserFields = "id, email, nome, role, created_at";
 
-const publicUserFields = 'id, email, nome, role, created_at';
-const ROLES_VALIDOS = ['admin', 'operador'];
-
-// Loga o erro real no servidor, mas nunca expõe detalhes internos (ex: mensagens do SQLite) ao cliente.
 function handleServerError(res, err) {
   console.error(err);
-  res.status(500).json({ error: 'Erro interno do servidor' });
-}
-
-// ==========================================
-// VALIDAÇÃO DE ENTRADA
-// O schema SQLite tem CHECK constraints que garantem a integridade, mas uma
-// violação lá estoura como exceção e viraria um 500 genérico. Validar aqui
-// devolve 400 com mensagem útil e mantém os logs limpos para detectar ataque real.
-// ==========================================
-
-// Erro de validação: carrega status e mensagem seguros para o cliente.
-class ValidacaoError extends Error {
-  constructor(mensagem, status = 400) {
-    super(mensagem);
-    this.name = 'ValidacaoError';
-    this.status = status;
-    this.clientMessage = mensagem;
-  }
-}
-
-const RE_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-
-// Formatos aceitos de placa, alinhados ao que a UI já produz (usePlacaMask):
-// antigo AAA1234, Mercosul AAA1A23, e o formato de 8 caracteres que o
-// frontend valida hoje (AAAA1AA11).
-const RE_PLACA = /^([A-Z]{3}\d{4}|[A-Z]{3}\d[A-Z]\d{2}|[A-Z]{4}\d[A-Z]{2}\d{2})$/;
-
-const SENHA_MINIMA = 10;
-
-// Remove caracteres de controle e limita o tamanho. Não escapa HTML: o React
-// já escapa na renderização, e escapar aqui causaria double-encoding no banco.
-const limparTexto = (valor, max = 200) => {
-  if (valor === undefined || valor === null) return null;
-  const texto = String(valor).normalize('NFC').replace(/[\u0000-\u001F\u007F]/g, '').trim();
-  return texto.slice(0, max);
-};
-
-const textoObrigatorio = (valor, campo, max = 200) => {
-  const texto = limparTexto(valor, max);
-  if (!texto) throw new ValidacaoError(`${campo} é obrigatório.`);
-  return texto;
-};
-
-// Aceita ausência quando há padrão; rejeita negativos, NaN e strings não numéricas.
-const numeroNaoNegativo = (valor, campo, padrao) => {
-  if (valor === undefined || valor === null || valor === '') {
-    if (padrao !== undefined) return padrao;
-    throw new ValidacaoError(`${campo} é obrigatório.`);
-  }
-  const numero = Number(valor);
-  if (!Number.isFinite(numero) || numero < 0) {
-    throw new ValidacaoError(`${campo} deve ser um número maior ou igual a zero.`);
-  }
-  return numero;
-};
-
-// O telefone é armazenado formatado — ex: "(11) 98888-7777". Valida pela
-// contagem de dígitos e preserva a formatação que a UI envia.
-const telefoneOpcional = (valor) => {
-  const texto = limparTexto(valor, 20);
-  if (!texto) return null;
-  const digitos = texto.replace(/\D/g, '');
-  if (digitos.length < 10 || digitos.length > 11) {
-    throw new ValidacaoError('Telefone deve ter 10 ou 11 dígitos (DDD + número).');
-  }
-  return texto;
-};
-
-const placaValida = (valor) => {
-  const placa = limparTexto(valor, 10).toUpperCase().replace(/[^A-Z0-9]/g, '');
-  if (!RE_PLACA.test(placa)) {
-    throw new ValidacaoError('Placa inválida. Use o formato AAA1234 ou AAA1A23.');
-  }
-  return placa;
-};
-
-const emailValido = (valor) => {
-  const email = textoObrigatorio(valor, 'E-mail', 120).toLowerCase();
-  if (!RE_EMAIL.test(email)) throw new ValidacaoError('E-mail inválido.');
-  return email;
-};
-
-// Converte ValidacaoError em 400; qualquer outra exceção segue para o 500 genérico.
-function responderErro(res, err) {
-  if (err instanceof ValidacaoError) {
-    return res.status(err.status).json({ error: err.clientMessage });
-  }
-  return handleServerError(res, err);
-}
-
-// Neutraliza gatilhos de fórmula do Excel/LibreOffice/Sheets prefixando a
-// célula com apóstrofo. Sem isso, um nome de cliente como =HYPERLINK(...)
-// é executado ao abrir o backup, podendo exfiltrar a planilha inteira.
-const CSV_GATILHOS_FORMULA = /^[=+\-@\t\r]/;
-
-function sanitizeCsvCell(valor) {
-  if (typeof valor !== 'string') return valor;
-  return CSV_GATILHOS_FORMULA.test(valor) ? `'${valor}` : valor;
+  res.status(500).json({ error: "Erro interno do servidor" });
 }
 
 // ==========================================
 // AUTH API (rotas públicas)
 // ==========================================
-app.post('/api/auth/login', loginLimiter, async (req, res) => {
+app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, senha } = req.body;
     if (!email || !senha) {
-      return res.status(400).json({ error: 'Email e senha são obrigatórios' });
+      return res.status(400).json({ error: "Email e senha são obrigatórios" });
     }
 
-    const user = await get('SELECT id, email, nome, role, password_hash FROM users WHERE email = ?', [email]);
-    const valid = user && await bcrypt.compare(senha, user.password_hash);
+    const user = await get(
+      "SELECT id, email, nome, role, password_hash FROM users WHERE email = ?",
+      [email],
+    );
+    const valid = user && (await bcrypt.compare(senha, user.password_hash));
     if (!valid) {
-      return res.status(401).json({ error: 'Email ou senha inválidos' });
+      return res.status(401).json({ error: "Email ou senha inválidos" });
     }
 
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role },
       JWT_SECRET,
-      { expiresIn: JWT_EXPIRES_IN, algorithm: JWT_ALGORITHM }
+      { expiresIn: JWT_EXPIRES_IN },
     );
-    res.json({ token, user: { id: user.id, nome: user.nome, email: user.email, role: user.role } });
-  } catch (err) { handleServerError(res, err); }
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        nome: user.nome,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.get('/api/auth/me', requireAuth, async (req, res) => {
+app.get("/api/auth/me", requireAuth, async (req, res) => {
   try {
-    const user = await get(`SELECT ${publicUserFields} FROM users WHERE id = ?`, [req.user.id]);
-    if (!user) return res.status(401).json({ error: 'Usuário não encontrado' });
+    const user = await get(
+      `SELECT ${publicUserFields} FROM users WHERE id = ?`,
+      [req.user.id],
+    );
+    if (!user) return res.status(401).json({ error: "Usuário não encontrado" });
     res.json(user);
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
 // A partir daqui, todas as rotas de /api exigem autenticação
-app.use('/api', requireAuth);
+app.use("/api", requireAuth);
 
 // ==========================================
 // USERS API (somente admin)
 // ==========================================
-app.get('/api/users', requireAdmin, async (req, res) => {
+app.get("/api/users", requireAdmin, async (req, res) => {
   try {
     const users = await all(`SELECT ${publicUserFields} FROM users`);
     res.json(users);
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.post('/api/users', requireAdmin, async (req, res) => {
+app.post("/api/users", requireAdmin, async (req, res) => {
   try {
-    const email = emailValido(req.body.email);
-    const nome = textoObrigatorio(req.body.nome, 'Nome', 120);
-    const senha = String(req.body.senha || '');
-    const role = req.body.role || 'operador';
-
-    if (senha.length < SENHA_MINIMA) {
-      throw new ValidacaoError(`A senha deve ter no mínimo ${SENHA_MINIMA} caracteres.`);
-    }
-    if (!ROLES_VALIDOS.includes(role)) {
-      throw new ValidacaoError(`Perfil inválido. Use um dos: ${ROLES_VALIDOS.join(', ')}`);
-    }
-
-    const existente = await get('SELECT id FROM users WHERE email = ?', [email]);
-    if (existente) throw new ValidacaoError('Já existe um usuário com este e-mail.', 409);
-
+    const { email, nome, role, senha } = req.body;
+    if (!senha) return res.status(400).json({ error: "Senha é obrigatória" });
     const newId = genId();
     const passwordHash = await bcrypt.hash(senha, 10);
-    await run('INSERT INTO users (id, email, nome, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)', [newId, email, nome, role, passwordHash, now()]);
-    const user = await get(`SELECT ${publicUserFields} FROM users WHERE id = ?`, [newId]);
+    await run(
+      "INSERT INTO users (id, email, nome, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      [newId, email, nome, role || "operador", passwordHash, now()],
+    );
+    const user = await get(
+      `SELECT ${publicUserFields} FROM users WHERE id = ?`,
+      [newId],
+    );
     res.json(user);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
 // ==========================================
 // CLIENTES API
 // ==========================================
-app.get('/api/clientes', async (req, res) => {
+app.get("/api/clientes", async (req, res) => {
   try {
-    // Retorna todos os clientes (sem filtro por user_id para simplificar)
-    const rows = await all('SELECT * FROM clientes', []);
+    const rows = await all("SELECT * FROM clientes", []);
     res.json(rows);
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.get('/api/clientes/:id', async (req, res) => {
+app.get("/api/clientes/:id", async (req, res) => {
   try {
-    const row = await get('SELECT * FROM clientes WHERE id = ?', [req.params.id]);
-    if (!row) return res.status(404).json({ error: 'Cliente não encontrado' });
+    const row = await get("SELECT * FROM clientes WHERE id = ?", [
+      req.params.id,
+    ]);
+    if (!row) return res.status(404).json({ error: "Cliente não encontrado" });
     res.json(row);
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.post('/api/clientes', async (req, res) => {
+app.post("/api/clientes", async (req, res) => {
   try {
-    const nome = textoObrigatorio(req.body.nome, 'Nome do cliente', 120);
-    const telefone = telefoneOpcional(req.body.telefone);
+    const { nome, telefone, data_nascimento } = req.body;
     const id = genId();
     const created_at = now();
-    await run('INSERT INTO clientes (id, user_id, nome, telefone, created_at) VALUES (?, ?, ?, ?, ?)', [id, req.user.id, nome, telefone, created_at]);
-    const row = await get('SELECT * FROM clientes WHERE id = ?', [id]);
+    await run(
+      "INSERT INTO clientes (id, user_id, nome, telefone, data_nascimento, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      [id, req.user.id, nome, telefone, data_nascimento || null, created_at],
+    );
+    const row = await get("SELECT * FROM clientes WHERE id = ?", [id]);
     res.json(row);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.put('/api/clientes/:id', async (req, res) => {
+app.put("/api/clientes/:id", async (req, res) => {
   try {
-    const nome = textoObrigatorio(req.body.nome, 'Nome do cliente', 120);
-    const telefone = telefoneOpcional(req.body.telefone);
-
-    const atual = await get('SELECT id FROM clientes WHERE id = ?', [req.params.id]);
-    if (!atual) return res.status(404).json({ error: 'Cliente não encontrado' });
-
-    await run('UPDATE clientes SET nome = ?, telefone = ? WHERE id = ?', [nome, telefone, req.params.id]);
-    const row = await get('SELECT * FROM clientes WHERE id = ?', [req.params.id]);
+    const { nome, telefone, data_nascimento } = req.body;
+    await run(
+      "UPDATE clientes SET nome = ?, telefone = ?, data_nascimento = ? WHERE id = ?",
+      [nome, telefone, data_nascimento || null, req.params.id],
+    );
+    const row = await get("SELECT * FROM clientes WHERE id = ?", [
+      req.params.id,
+    ]);
     res.json(row);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.delete('/api/clientes/:id', requireAdmin, async (req, res) => {
+app.delete("/api/clientes/:id", async (req, res) => {
   try {
-    const existente = await get('SELECT id FROM clientes WHERE id = ?', [req.params.id]);
-    if (!existente) return res.status(404).json({ error: 'Cliente não encontrado' });
-
-    // O cascade do cliente derruba veículos, lavagens e histórico: audita tudo
-    // o que vai embora antes de executar o DELETE.
-    await auditarExclusaoLavagens(req.user.id, await lavagensEmCascata('cliente_id', req.params.id), 'exclusao_cliente');
-    await run('DELETE FROM clientes WHERE id = ?', [req.params.id]);
+    await run("DELETE FROM clientes WHERE id = ?", [req.params.id]);
     res.json({ success: true });
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
 // ==========================================
 // VEICULOS API
 // ==========================================
-app.get('/api/veiculos', async (req, res) => {
+app.get("/api/veiculos", async (req, res) => {
   try {
     const { cliente_id } = req.query;
-    let query = 'SELECT * FROM veiculos';
+    let query = "SELECT * FROM veiculos";
     let params = [];
-    if (cliente_id) { query += ' WHERE cliente_id = ?'; params.push(cliente_id); }
+    if (cliente_id) {
+      query += " WHERE cliente_id = ?";
+      params.push(cliente_id);
+    }
     const rows = await all(query, params);
     res.json(rows);
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.post('/api/veiculos', async (req, res) => {
+app.post("/api/veiculos", async (req, res) => {
   try {
-    const { cliente_id } = req.body;
-    if (!cliente_id) throw new ValidacaoError('Cliente é obrigatório.');
-
-    const modelo = textoObrigatorio(req.body.modelo, 'Modelo', 80);
-    const placa = placaValida(req.body.placa);
-    const marca = limparTexto(req.body.marca, 60);
-    const cor = limparTexto(req.body.cor, 40);
-
-    const cliente = await get('SELECT id FROM clientes WHERE id = ?', [cliente_id]);
-    if (!cliente) throw new ValidacaoError('Cliente não encontrado.', 404);
-
+    const { cliente_id, placa, marca, cor, modelo } = req.body;
+    if (
+      !cliente_id ||
+      !String(modelo || "").trim() ||
+      !String(placa || "").trim()
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Cliente, modelo e placa são obrigatórios." });
+    }
     const id = genId();
-    await run('INSERT INTO veiculos (id, cliente_id, user_id, placa, marca, cor, modelo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, cliente_id, req.user.id, placa, marca, cor, modelo, now()]);
-    const row = await get('SELECT * FROM veiculos WHERE id = ?', [id]);
+    await run(
+      "INSERT INTO veiculos (id, cliente_id, user_id, placa, marca, cor, modelo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [id, cliente_id, req.user.id, placa, marca, cor, modelo, now()],
+    );
+    const row = await get("SELECT * FROM veiculos WHERE id = ?", [id]);
     res.json(row);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.delete('/api/veiculos/:id', requireAdmin, async (req, res) => {
+app.put("/api/veiculos/:id", async (req, res) => {
   try {
-    const existente = await get('SELECT id FROM veiculos WHERE id = ?', [req.params.id]);
-    if (!existente) return res.status(404).json({ error: 'Veículo não encontrado' });
+    const { modelo, placa, cor, marca } = req.body;
+    if (!String(modelo || "").trim() || !String(placa || "").trim()) {
+      return res
+        .status(400)
+        .json({ error: "Modelo e placa são obrigatórios." });
+    }
+    await run(
+      "UPDATE veiculos SET modelo = ?, placa = ?, cor = ?, marca = ? WHERE id = ?",
+      [modelo, placa, cor, marca, req.params.id],
+    );
+    const row = await get("SELECT * FROM veiculos WHERE id = ?", [
+      req.params.id,
+    ]);
+    res.json(row);
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
 
-    await auditarExclusaoLavagens(req.user.id, await lavagensEmCascata('veiculo_id', req.params.id), 'exclusao_veiculo');
-    await run('DELETE FROM veiculos WHERE id = ?', [req.params.id]);
+app.delete("/api/veiculos/:id", async (req, res) => {
+  try {
+    await run("DELETE FROM veiculos WHERE id = ?", [req.params.id]);
     res.json({ success: true });
-  } catch (err) { handleServerError(res, err); }
-});
-
-app.put('/api/veiculos/:id', async (req, res) => {
-  try {
-    const modelo = textoObrigatorio(req.body.modelo, 'Modelo', 80);
-    const placa = placaValida(req.body.placa);
-    const cor = limparTexto(req.body.cor, 40);
-
-    const atual = await get('SELECT id FROM veiculos WHERE id = ?', [req.params.id]);
-    if (!atual) return res.status(404).json({ error: 'Veículo não encontrado' });
-
-    await run('UPDATE veiculos SET modelo = ?, placa = ?, cor = ? WHERE id = ?', [modelo, placa, cor, req.params.id]);
-    const row = await get('SELECT * FROM veiculos WHERE id = ?', [req.params.id]);
-    res.json(row);
-  } catch (err) { responderErro(res, err); }
-});
-
-app.post('/api/veiculos/migrate-plates', requireAdmin, async (req, res) => {
-  try {
-    const result = await run("UPDATE veiculos SET placa = REPLACE(placa, '-', '')");
-    res.json({ success: true, message: 'Placas normalizadas com sucesso' });
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
 // ==========================================
 // TIPOS_LAVAGEM API
 // ==========================================
-app.get('/api/tipos-lavagem', async (req, res) => {
+app.get("/api/tipos-lavagem", async (req, res) => {
   try {
-    const rows = await all('SELECT * FROM tipos_lavagem');
+    const rows = await all("SELECT * FROM tipos_lavagem");
     res.json(rows);
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.post('/api/tipos-lavagem', requireAdmin, async (req, res) => {
+app.post("/api/tipos-lavagem", requireAdmin, async (req, res) => {
   try {
-    const nome = textoObrigatorio(req.body.nome, 'Nome do tipo de lavagem', 80);
-    const descricao = limparTexto(req.body.descricao, 300);
-    const preco = numeroNaoNegativo(req.body.preco, 'Preço');
+    const { nome, descricao, preco } = req.body;
     const id = genId();
-    await run('INSERT INTO tipos_lavagem (id, nome, descricao, preco, created_at) VALUES (?, ?, ?, ?, ?)', [id, nome, descricao, preco, now()]);
-    const row = await get('SELECT * FROM tipos_lavagem WHERE id = ?', [id]);
+    await run(
+      "INSERT INTO tipos_lavagem (id, nome, descricao, preco, created_at) VALUES (?, ?, ?, ?, ?)",
+      [id, nome, descricao, preco, now()],
+    );
+    const row = await get("SELECT * FROM tipos_lavagem WHERE id = ?", [id]);
     res.json(row);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.put('/api/tipos-lavagem/:id', requireAdmin, async (req, res) => {
+app.put("/api/tipos-lavagem/:id", requireAdmin, async (req, res) => {
   try {
-    const nome = textoObrigatorio(req.body.nome, 'Nome do tipo de lavagem', 80);
-    const descricao = limparTexto(req.body.descricao, 300);
-    const preco = numeroNaoNegativo(req.body.preco, 'Preço');
-
-    const atual = await get('SELECT id FROM tipos_lavagem WHERE id = ?', [req.params.id]);
-    if (!atual) return res.status(404).json({ error: 'Tipo de lavagem não encontrado' });
-
-    await run('UPDATE tipos_lavagem SET nome = ?, descricao = ?, preco = ? WHERE id = ?', [nome, descricao, preco, req.params.id]);
-    const row = await get('SELECT * FROM tipos_lavagem WHERE id = ?', [req.params.id]);
+    const { nome, descricao, preco } = req.body;
+    await run(
+      "UPDATE tipos_lavagem SET nome = ?, descricao = ?, preco = ? WHERE id = ?",
+      [nome, descricao, preco, req.params.id],
+    );
+    const row = await get("SELECT * FROM tipos_lavagem WHERE id = ?", [
+      req.params.id,
+    ]);
     res.json(row);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.delete('/api/tipos-lavagem/:id', requireAdmin, async (req, res) => {
+app.delete("/api/tipos-lavagem/:id", requireAdmin, async (req, res) => {
   try {
-    await run('DELETE FROM tipos_lavagem WHERE id = ?', [req.params.id]);
+    await run("DELETE FROM tipos_lavagem WHERE id = ?", [req.params.id]);
     res.json({ success: true });
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
 // ==========================================
 // LAVAGENS API
 // ==========================================
-const STATUS_LAVAGEM = ['pendente', 'em_progresso', 'concluida', 'cancelada'];
+const STATUS_LAVAGEM = ["pendente", "em_progresso", "concluida", "cancelada"];
 
-// Exclusão é a única alteração que apaga a métrica do BI sem deixar rastro no
-// próprio registro — então a trilha precisa ser gravada ANTES do DELETE, com um
-// retrato completo da linha em `valor_anterior`. A FK de auditoria_lavagens não
-// tem mais ON DELETE CASCADE (ver migração em db.js), portanto estas linhas
-// sobrevivem à remoção da lavagem e das entidades que a originaram (FA-03/FA-04).
-async function auditarExclusaoLavagens(userId, lavagemIds, origem) {
-  for (const lavagemId of lavagemIds) {
-    const lavagem = await get('SELECT * FROM lavagens WHERE id = ?', [lavagemId]);
-    if (!lavagem) continue;
-    await run(`INSERT INTO auditoria_lavagens (id, lavagem_id, user_id, campo, valor_anterior, valor_novo, data)
-               VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [genId(), lavagemId, userId, origem, JSON.stringify(lavagem), null, now()]);
-  }
-}
-
-// Lavagens atingidas em cascata (FK ON DELETE CASCADE) ao remover um cliente
-// ou um veículo. Precisam ser auditadas pelo mesmo motivo da exclusão direta.
-async function lavagensEmCascata(coluna, id) {
-  const rows = await all(`SELECT id FROM lavagens WHERE ${coluna} = ?`, [id]);
-  return rows.map(r => r.id);
-}
-
-app.get('/api/lavagens', async (req, res) => {
+app.get("/api/lavagens", async (req, res) => {
   try {
     const { cliente_id } = req.query;
-    let query = 'SELECT * FROM lavagens';
+    let query = "SELECT * FROM lavagens";
     let params = [];
-    if (cliente_id) { query += ' WHERE cliente_id = ?'; params.push(cliente_id); }
-    query += ' ORDER BY data DESC';
+    if (cliente_id) {
+      query += " WHERE cliente_id = ?";
+      params.push(cliente_id);
+    }
+    query += " ORDER BY data DESC";
     const rows = await all(query, params);
     res.json(rows);
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.post('/api/lavagens', async (req, res) => {
+app.post("/api/lavagens", async (req, res) => {
   try {
-    const { cliente_id, veiculo_id, tipo_lavagem_id, status, valor, pagamento, observacao } = req.body;
+    const {
+      cliente_id,
+      veiculo_id,
+      tipo_lavagem_id,
+      status,
+      valor,
+      pagamento,
+      observacao,
+    } = req.body;
     if (!cliente_id || !veiculo_id || !tipo_lavagem_id) {
-      return res.status(400).json({ error: 'Cliente, veículo e tipo de lavagem são obrigatórios.' });
+      return res.status(400).json({
+        error: "Cliente, veículo e tipo de lavagem são obrigatórios.",
+      });
     }
-    const statusFinal = status || 'pendente';
+    const statusFinal = status || "pendente";
     if (!STATUS_LAVAGEM.includes(statusFinal)) {
-      return res.status(400).json({ error: `Status inválido. Use um dos: ${STATUS_LAVAGEM.join(', ')}` });
-    }
-    // Uma lavagem não pode nascer concluída: isso pularia o fluxo de pátio e
-    // injetaria receita no BI sem nenhuma transição auditável. Só o admin pode
-    // fazer esse lançamento retroativo (FA-02).
-    if (statusFinal === 'concluida' && !(await ehAdmin(req))) {
-      return res.status(403).json({
-        error: 'Apenas administradores podem registrar uma lavagem já concluída. Crie a lavagem como pendente e conclua pelo fluxo do pátio.',
+      return res.status(400).json({
+        error: `Status inválido. Use um dos: ${STATUS_LAVAGEM.join(", ")}`,
       });
     }
     const valorNum = Number(valor);
     if (!Number.isFinite(valorNum) || valorNum < 0) {
-      return res.status(400).json({ error: 'O valor da lavagem deve ser um número maior ou igual a zero.' });
+      return res.status(400).json({
+        error: "O valor da lavagem deve ser um número maior ou igual a zero.",
+      });
     }
-    const observacaoLimpa = limparTexto(observacao, 500);
-    const pagamentoLimpo = limparTexto(pagamento, 40) || 'Pendente';
-
     const id = genId();
-    const dataConclusao = statusFinal === 'concluida' ? now() : null;
-    await run(`INSERT INTO lavagens (id, cliente_id, veiculo_id, tipo_lavagem_id, status, valor, data, user_id, pagamento, observacao, data_conclusao)
+    const dataConclusao = statusFinal === "concluida" ? now() : null;
+    await run(
+      `INSERT INTO lavagens (id, cliente_id, veiculo_id, tipo_lavagem_id, status, valor, data, user_id, pagamento, observacao, data_conclusao)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, cliente_id, veiculo_id, tipo_lavagem_id, statusFinal, valorNum, now(), req.user.id, pagamentoLimpo, observacaoLimpa, dataConclusao]);
-    const row = await get('SELECT * FROM lavagens WHERE id = ?', [id]);
+      [
+        id,
+        cliente_id,
+        veiculo_id,
+        tipo_lavagem_id,
+        statusFinal,
+        valorNum,
+        now(),
+        req.user.id,
+        pagamento || "Pendente",
+        observacao,
+        dataConclusao,
+      ],
+    );
+    const row = await get("SELECT * FROM lavagens WHERE id = ?", [id]);
     res.json(row);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.put('/api/lavagens/:id', async (req, res) => {
+app.put("/api/lavagens/:id", async (req, res) => {
   try {
-    const { status, valor, pagamento, observacao } = req.body;
+    const { status, valor, pagamento, observacao, data_conclusao } = req.body;
     if (status !== undefined && !STATUS_LAVAGEM.includes(status)) {
-      return res.status(400).json({ error: `Status inválido. Use um dos: ${STATUS_LAVAGEM.join(', ')}` });
+      return res.status(400).json({
+        error: `Status inválido. Use um dos: ${STATUS_LAVAGEM.join(", ")}`,
+      });
     }
     let valorNum;
     if (valor !== undefined) {
       valorNum = Number(valor);
       if (!Number.isFinite(valorNum) || valorNum < 0) {
-        return res.status(400).json({ error: 'O valor da lavagem deve ser um número maior ou igual a zero.' });
+        return res.status(400).json({
+          error: "O valor da lavagem deve ser um número maior ou igual a zero.",
+        });
       }
     }
 
-    const anterior = await get('SELECT valor, pagamento, status FROM lavagens WHERE id = ?', [req.params.id]);
-    if (!anterior) return res.status(404).json({ error: 'Lavagem não encontrada' });
-
-    // Campos financeiros mexem direto na receita e no ticket médio do BI. A
-    // auditoria registra a mudança, mas o registro não basta: a alteração em si
-    // passa a exigir perfil de admin (FA-05). Operador segue podendo avançar o
-    // status e anotar observações.
-    const mudaValor = valor !== undefined && Number(valor) !== Number(anterior.valor);
-    const mudaPagamento = pagamento !== undefined && limparTexto(pagamento, 40) !== anterior.pagamento;
-    if ((mudaValor || mudaPagamento) && !(await ehAdmin(req))) {
-      return res.status(403).json({ error: 'Apenas administradores podem alterar valor ou forma de pagamento da lavagem.' });
-    }
-
-    const pagamentoLimpo = pagamento !== undefined ? limparTexto(pagamento, 40) : undefined;
-    const observacaoLimpa = observacao !== undefined ? limparTexto(observacao, 500) : undefined;
-
     const updates = [];
     const params = [];
-    if (status !== undefined) { updates.push('status = ?'); params.push(status); }
-    if (valor !== undefined) { updates.push('valor = ?'); params.push(valorNum); }
-    if (pagamento !== undefined) { updates.push('pagamento = ?'); params.push(pagamentoLimpo); }
-    if (observacao !== undefined) { updates.push('observacao = ?'); params.push(observacaoLimpa); }
+    if (status !== undefined) {
+      updates.push("status = ?");
+      params.push(status);
+    }
+    if (valor !== undefined) {
+      updates.push("valor = ?");
+      params.push(valorNum);
+    }
+    if (pagamento !== undefined) {
+      updates.push("pagamento = ?");
+      params.push(pagamento);
+    }
+    if (observacao !== undefined) {
+      updates.push("observacao = ?");
+      params.push(observacao);
+    }
 
-    // data_conclusao é propriedade exclusiva do servidor: só é gravada na
-    // transição para 'concluida'. Qualquer `data_conclusao` vinda do corpo da
-    // requisição é ignorada — aceitá-la permitia forjar a data e distorcer as
-    // métricas de fidelização e fluxo diário do BI (FA-01).
-    if (status === 'concluida' && anterior.status !== 'concluida') {
-      updates.push('data_conclusao = ?'); params.push(now());
+    if (status === "concluida") {
+      updates.push("data_conclusao = ?");
+      params.push(now());
+    } else if (data_conclusao !== undefined) {
+      updates.push("data_conclusao = ?");
+      params.push(data_conclusao);
     }
 
     if (updates.length > 0) {
       params.push(req.params.id);
-      await run(`UPDATE lavagens SET ${updates.join(', ')} WHERE id = ?`, params);
-
-      // Trilha de auditoria: registra quem alterou campos financeiros e qual era
-      // o valor anterior. Sem isso, reduzir o valor de uma lavagem antiga é
-      // indistinguível de um lançamento legítimo no dashboard de BI.
-      const novosValores = { status, valor: valorNum, pagamento: pagamentoLimpo };
-      for (const campo of ['valor', 'pagamento', 'status']) {
-        const novo = novosValores[campo];
-        if (novo === undefined) continue;
-        if (String(novo) === String(anterior[campo])) continue;
-
-        await run(`INSERT INTO auditoria_lavagens (id, lavagem_id, user_id, campo, valor_anterior, valor_novo, data)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [genId(), req.params.id, req.user.id, campo,
-           anterior[campo] === null ? null : String(anterior[campo]),
-           novo === null ? null : String(novo), now()]);
-      }
+      await run(
+        `UPDATE lavagens SET ${updates.join(", ")} WHERE id = ?`,
+        params,
+      );
     }
-    const row = await get('SELECT * FROM lavagens WHERE id = ?', [req.params.id]);
+    const row = await get("SELECT * FROM lavagens WHERE id = ?", [
+      req.params.id,
+    ]);
     res.json(row);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.delete('/api/lavagens/:id', requireAdmin, async (req, res) => {
+app.delete("/api/lavagens/:id", async (req, res) => {
   try {
-    const existente = await get('SELECT id FROM lavagens WHERE id = ?', [req.params.id]);
-    if (!existente) return res.status(404).json({ error: 'Lavagem não encontrada' });
-
-    await auditarExclusaoLavagens(req.user.id, [req.params.id], 'exclusao_lavagem');
-    await run('DELETE FROM lavagens WHERE id = ?', [req.params.id]);
+    await run("DELETE FROM lavagens WHERE id = ?", [req.params.id]);
     res.json({ success: true });
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
 // ==========================================
 // PRODUTOS API
 // ==========================================
-app.get('/api/produtos', async (req, res) => {
+app.get("/api/produtos", async (req, res) => {
   try {
-    const rows = await all('SELECT * FROM produtos', []);
+    const rows = await all("SELECT * FROM produtos", []);
     res.json(rows);
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.post('/api/produtos', requireAdmin, async (req, res) => {
+app.post("/api/produtos", requireAdmin, async (req, res) => {
   try {
-    const nome = textoObrigatorio(req.body.nome, 'Nome do produto', 120);
-    const quantidade = numeroNaoNegativo(req.body.quantidade, 'Quantidade', 0);
-    const estoqueMinimo = numeroNaoNegativo(req.body.estoque_minimo, 'Estoque mínimo', 5);
-    const precoUnitario = numeroNaoNegativo(req.body.preco_unitario, 'Preço unitário', 0);
-    const categoria = limparTexto(req.body.categoria, 60) || 'Outros';
-    const unidade = limparTexto(req.body.unidade, 10) || 'un';
-
+    const {
+      nome,
+      quantidade,
+      estoque_minimo,
+      categoria,
+      unidade,
+      preco_unitario,
+    } = req.body;
     const id = genId();
-    await run(`INSERT INTO produtos (id, nome, quantidade, estoque_minimo, categoria, unidade, preco_unitario, user_id, created_at)
+    await run(
+      `INSERT INTO produtos (id, nome, quantidade, estoque_minimo, categoria, unidade, preco_unitario, user_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, nome, quantidade, estoqueMinimo, categoria, unidade, precoUnitario, req.user.id, now()]);
-    const row = await get('SELECT * FROM produtos WHERE id = ?', [id]);
+      [
+        id,
+        nome,
+        quantidade || 0,
+        estoque_minimo || 5,
+        categoria || "Outros",
+        unidade || "un",
+        preco_unitario || 0,
+        req.user.id,
+        now(),
+      ],
+    );
+    const row = await get("SELECT * FROM produtos WHERE id = ?", [id]);
     res.json(row);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.put('/api/produtos/:id', requireAdmin, async (req, res) => {
+app.put("/api/produtos/:id", requireAdmin, async (req, res) => {
   try {
-    const atual = await get('SELECT * FROM produtos WHERE id = ?', [req.params.id]);
-    if (!atual) return res.status(404).json({ error: 'Produto não encontrado' });
-
-    const nome = textoObrigatorio(req.body.nome, 'Nome do produto', 120);
-    const quantidade = numeroNaoNegativo(req.body.quantidade, 'Quantidade', atual.quantidade);
-    const estoqueMinimo = numeroNaoNegativo(req.body.estoque_minimo, 'Estoque mínimo', atual.estoque_minimo);
-    const precoUnitario = numeroNaoNegativo(req.body.preco_unitario, 'Preço unitário', atual.preco_unitario);
-    const categoria = limparTexto(req.body.categoria, 60) || atual.categoria;
-    const unidade = limparTexto(req.body.unidade, 10) || atual.unidade;
-
-    await run(`UPDATE produtos SET nome = ?, quantidade = ?, estoque_minimo = ?, categoria = ?, unidade = ?, preco_unitario = ? WHERE id = ?`,
-      [nome, quantidade, estoqueMinimo, categoria, unidade, precoUnitario, req.params.id]);
-    const row = await get('SELECT * FROM produtos WHERE id = ?', [req.params.id]);
+    const {
+      nome,
+      quantidade,
+      estoque_minimo,
+      categoria,
+      unidade,
+      preco_unitario,
+    } = req.body;
+    await run(
+      `UPDATE produtos SET nome = ?, quantidade = ?, estoque_minimo = ?, categoria = ?, unidade = ?, preco_unitario = ? WHERE id = ?`,
+      [
+        nome,
+        quantidade,
+        estoque_minimo,
+        categoria,
+        unidade,
+        preco_unitario,
+        req.params.id,
+      ],
+    );
+    const row = await get("SELECT * FROM produtos WHERE id = ?", [
+      req.params.id,
+    ]);
     res.json(row);
-  } catch (err) { responderErro(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-app.delete('/api/produtos/:id', requireAdmin, async (req, res) => {
+app.delete("/api/produtos/:id", requireAdmin, async (req, res) => {
   try {
-    await run('DELETE FROM produtos WHERE id = ?', [req.params.id]);
+    await run("DELETE FROM produtos WHERE id = ?", [req.params.id]);
     res.json({ success: true });
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
 // ==========================================
 // MOVIMENTACOES API
 // ==========================================
-app.get('/api/movimentacoes', async (req, res) => {
+app.get("/api/movimentacoes", async (req, res) => {
   try {
-    let query = 'SELECT * FROM movimentacoes';
-    let params = [];
-    query += ' ORDER BY data DESC';
-    const rows = await all(query, params);
+    let query = "SELECT * FROM movimentacoes ORDER BY data DESC";
+    const rows = await all(query, []);
     res.json(rows);
-  } catch (err) { handleServerError(res, err); }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
-const TIPOS_MOVIMENTACAO = ['entrada', 'saida'];
+const TIPOS_MOVIMENTACAO = ["entrada", "saida"];
 
-// Todas as requisições compartilham uma única conexão SQLite, e o sqlite3 não
-// aceita BEGIN aninhado nela: duas movimentações simultâneas faziam a segunda
-// falhar com "cannot start a transaction within a transaction" (HTTP 500).
-// Esta fila serializa as seções críticas — as requisições concorrentes esperam
-// sua vez em vez de falhar, e o BEGIN IMMEDIATE continua garantindo que leitura
-// e escrita do saldo sejam atômicas.
-let filaTransacoes = Promise.resolve();
-
-function emTransacaoSerializada(tarefa) {
-  const resultado = filaTransacoes.then(tarefa, tarefa);
-  // A fila nunca "quebra": um erro da tarefa é devolvido ao chamador, mas a
-  // corrente segue viva para a próxima requisição.
-  filaTransacoes = resultado.then(() => undefined, () => undefined);
-  return resultado;
-}
-
-app.post('/api/movimentacoes', requireAdmin, async (req, res) => {
+app.post("/api/movimentacoes", requireAdmin, async (req, res) => {
   const { produto_id, tipo, observacao } = req.body;
   const quantidade = Number(req.body.quantidade);
 
   if (!TIPOS_MOVIMENTACAO.includes(tipo)) {
-    return res.status(400).json({ error: `Campo 'tipo' inválido. Use um dos: ${TIPOS_MOVIMENTACAO.join(', ')}` });
+    return res.status(400).json({
+      error: `Campo 'tipo' inválido. Use um dos: ${TIPOS_MOVIMENTACAO.join(", ")}`,
+    });
   }
   if (!Number.isFinite(quantidade) || quantidade <= 0) {
-    return res.status(400).json({ error: 'A quantidade deve ser um número positivo.' });
+    return res
+      .status(400)
+      .json({ error: "A quantidade deve ser um número positivo." });
   }
 
   try {
-    // A seção crítica roda serializada (ver emTransacaoSerializada) e devolve o
-    // que a rota deve responder, em vez de escrever na resposta lá dentro.
-    const resultado = await emTransacaoSerializada(async () => {
-      // BEGIN IMMEDIATE trava a escrita já no início da transação, evitando que duas
-      // movimentações concorrentes leiam o mesmo estoque antigo e gerem um "lost update".
-      await exec('BEGIN IMMEDIATE TRANSACTION;');
-      try {
-        const produto = await get('SELECT quantidade FROM produtos WHERE id = ?', [produto_id]);
-        if (!produto) {
-          await exec('ROLLBACK;');
-          return { status: 404, body: { error: 'Produto não encontrado' } };
-        }
+    await exec("BEGIN IMMEDIATE TRANSACTION;");
+    try {
+      const produto = await get(
+        "SELECT quantidade FROM produtos WHERE id = ?",
+        [produto_id],
+      );
+      if (!produto) {
+        await exec("ROLLBACK;");
+        return res.status(404).json({ error: "Produto não encontrado" });
+      }
 
-        if (tipo === 'saida' && produto.quantidade < quantidade) {
-          await exec('ROLLBACK;');
-          return { status: 400, body: { error: `Estoque insuficiente. Disponível: ${produto.quantidade}` } };
-        }
+      if (tipo === "saida" && produto.quantidade < quantidade) {
+        await exec("ROLLBACK;");
+        return res.status(400).json({
+          error: `Estoque insuficiente. Disponível: ${produto.quantidade}`,
+        });
+      }
 
-        const novaQuantidade = tipo === 'entrada'
+      const novaQuantidade =
+        tipo === "entrada"
           ? produto.quantidade + quantidade
           : produto.quantidade - quantidade;
 
-        await run('UPDATE produtos SET quantidade = ? WHERE id = ?', [novaQuantidade, produto_id]);
+      await run("UPDATE produtos SET quantidade = ? WHERE id = ?", [
+        novaQuantidade,
+        produto_id,
+      ]);
 
-        const id = genId();
-        await run(`INSERT INTO movimentacoes (id, produto_id, tipo, quantidade, observacao, user_id, data)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [id, produto_id, tipo, quantidade, limparTexto(observacao, 500), req.user.id, now()]);
+      const id = genId();
+      await run(
+        `INSERT INTO movimentacoes (id, produto_id, tipo, quantidade, observacao, user_id, data)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          produto_id,
+          tipo,
+          quantidade,
+          observacao || "",
+          req.user.id,
+          now(),
+        ],
+      );
 
-        await exec('COMMIT;');
+      await exec("COMMIT;");
 
-        const produtoAtualizado = await get('SELECT * FROM produtos WHERE id = ?', [produto_id]);
-        const row = await get('SELECT * FROM movimentacoes WHERE id = ?', [id]);
-        return { status: 200, body: { movimentacao: row, produto: produtoAtualizado } };
-      } catch (e) {
-        // ROLLBACK best-effort: se ele próprio falhar, o erro original é o que importa.
-        await exec('ROLLBACK;').catch(() => {});
-        throw e;
-      }
-    });
-
-    res.status(resultado.status).json(resultado.body);
-  } catch (err) { responderErro(res, err); }
+      const produtoAtualizado = await get(
+        "SELECT * FROM produtos WHERE id = ?",
+        [produto_id],
+      );
+      const row = await get("SELECT * FROM movimentacoes WHERE id = ?", [id]);
+      res.json({ movimentacao: row, produto: produtoAtualizado });
+    } catch (e) {
+      await exec("ROLLBACK;");
+      throw e;
+    }
+  } catch (err) {
+    handleServerError(res, err);
+  }
 });
 
 // ==========================================
 // DASHBOARD & ANALYTICS API
 // ==========================================
-app.get('/api/dashboard/stats', async (req, res) => {
+app.get("/api/dashboard/stats", async (req, res) => {
   try {
     // 1. Resumo Financeiro da Semana Atual vs Semana Anterior
     const semanaAtual = await get(`
@@ -837,27 +675,43 @@ app.get('/api/dashboard/stats', async (req, res) => {
 
     const receitaSemana = Number(semanaAtual?.receita || 0);
     const lavagensSemana = Number(semanaAtual?.lavagens || 0);
-    const ticketMedio = lavagensSemana > 0 ? Number((receitaSemana / lavagensSemana).toFixed(2)) : 0;
+    const ticketMedio =
+      lavagensSemana > 0
+        ? Number((receitaSemana / lavagensSemana).toFixed(2))
+        : 0;
 
     const receitaSemanaAnterior = Number(semanaAnterior?.receita || 0);
     const lavagensSemanaAnterior = Number(semanaAnterior?.lavagens || 0);
-    const ticketMedioAnterior = lavagensSemanaAnterior > 0 ? (receitaSemanaAnterior / lavagensSemanaAnterior) : 0;
+    const ticketMedioAnterior =
+      lavagensSemanaAnterior > 0
+        ? receitaSemanaAnterior / lavagensSemanaAnterior
+        : 0;
 
     let variacaoReceitaPct = 0;
     if (receitaSemanaAnterior > 0) {
-      variacaoReceitaPct = Number((((receitaSemana - receitaSemanaAnterior) / receitaSemanaAnterior) * 100).toFixed(1));
+      variacaoReceitaPct = Number(
+        (
+          ((receitaSemana - receitaSemanaAnterior) / receitaSemanaAnterior) *
+          100
+        ).toFixed(1),
+      );
     } else if (receitaSemana > 0) {
       variacaoReceitaPct = 100;
     }
 
     let variacaoTicketPct = 0;
     if (ticketMedioAnterior > 0) {
-      variacaoTicketPct = Number((((ticketMedio - ticketMedioAnterior) / ticketMedioAnterior) * 100).toFixed(1));
+      variacaoTicketPct = Number(
+        (
+          ((ticketMedio - ticketMedioAnterior) / ticketMedioAnterior) *
+          100
+        ).toFixed(1),
+      );
     } else if (ticketMedio > 0) {
       variacaoTicketPct = 100;
     }
 
-    // Fluxo Diário dos Últimos 7 dias (Série temporal contínua para o gráfico)
+    // Fluxo Diário dos Últimos 7 dias
     const ultimos7DiasRows = await all(`
       SELECT 
         substr(data, 1, 10) as dia_data,
@@ -869,11 +723,14 @@ app.get('/api/dashboard/stats', async (req, res) => {
     `);
 
     const mapaDias = new Map();
-    ultimos7DiasRows.forEach(r => {
-      mapaDias.set(r.dia_data, { lavagens: Number(r.lavagens), receita: Number(r.receita) });
+    ultimos7DiasRows.forEach((r) => {
+      mapaDias.set(r.dia_data, {
+        lavagens: Number(r.lavagens),
+        receita: Number(r.receita),
+      });
     });
 
-    const diasSemanaNomes = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+    const diasSemanaNomes = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
     const fluxoDiario7d = [];
     for (let i = 6; i >= 0; i--) {
       const d = new Date();
@@ -885,7 +742,7 @@ app.get('/api/dashboard/stats', async (req, res) => {
         data: dataIso,
         dia: diaNome,
         lavagens: registro.lavagens,
-        receita: registro.receita
+        receita: registro.receita,
       });
     }
 
@@ -897,10 +754,15 @@ app.get('/api/dashboard/stats', async (req, res) => {
       GROUP BY cliente_id
     `);
     const totalClientesComLavagem = recorrenciaRows.length;
-    const clientesRecorrentes = recorrenciaRows.filter(r => r.qtd >= 2).length;
-    const taxaRecorrenciaPct = totalClientesComLavagem > 0 
-      ? Number(((clientesRecorrentes / totalClientesComLavagem) * 100).toFixed(1)) 
-      : 0;
+    const clientesRecorrentes = recorrenciaRows.filter(
+      (r) => r.qtd >= 2,
+    ).length;
+    const taxaRecorrenciaPct =
+      totalClientesComLavagem > 0
+        ? Number(
+            ((clientesRecorrentes / totalClientesComLavagem) * 100).toFixed(1),
+          )
+        : 0;
 
     // 3. Radar de Clientes Ausentes (> 30 dias)
     const clientesAusentes = await all(`
@@ -920,151 +782,24 @@ app.get('/api/dashboard/stats', async (req, res) => {
       LIMIT 5
     `);
 
-    // 4. Mix de Serviços dos Últimos 30 Dias (Volume vs Receita)
-    const mixTipos = await all(`
-      SELECT 
-        t.id, 
-        t.nome,
-        COUNT(l.id) as total_atendimentos,
-        COALESCE(SUM(l.valor), 0) as faturamento_total
-      FROM tipos_lavagem t
-      LEFT JOIN lavagens l ON l.tipo_lavagem_id = t.id AND l.status = 'concluida' AND l.data >= datetime('now', '-30 days')
-      GROUP BY t.id, t.nome
-      ORDER BY faturamento_total DESC
+    // 4. Insumos em Estado Crítico
+    const produtosCriticosRows = await all(`
+      SELECT id, nome, quantidade, estoque_minimo, unidade
+      FROM produtos
+      WHERE quantidade <= estoque_minimo
+      ORDER BY quantidade ASC
     `);
 
-    const totalAtendimentos30d = mixTipos.reduce((s, t) => s + Number(t.total_atendimentos), 0);
-    const totalFaturamento30d = mixTipos.reduce((s, t) => s + Number(t.faturamento_total), 0);
-
-    const mixServicos = mixTipos.map(item => {
-      const atendimentos = Number(item.total_atendimentos);
-      const faturamento = Number(item.faturamento_total);
-      return {
-        id: item.id,
-        nome: item.nome,
-        total_atendimentos: atendimentos,
-        faturamento_total: faturamento,
-        pct_volume: totalAtendimentos30d > 0 ? Number(((atendimentos / totalAtendimentos30d) * 100).toFixed(1)) : 0,
-        pct_receita: totalFaturamento30d > 0 ? Number(((faturamento / totalFaturamento30d) * 100).toFixed(1)) : 0,
-      };
-    });
-
-    // 5. [B1] Faturamento por Forma de Pagamento (últimos 30 dias)
-    // Os dados já eram coletados em cada lavagem (pagamento), mas nunca
-    // agregados — este bloco fecha a lacuna: PIX/Dinheiro/Cartão/outros no
-    // mesmo período do mix de serviços.
-    const pagamentosRows = await all(`
-      SELECT 
-        COALESCE(NULLIF(TRIM(pagamento), ''), 'Pendente') as forma_pagamento,
-        COUNT(*) as lavagens,
-        COALESCE(SUM(valor), 0) as receita
-      FROM lavagens
-      WHERE status = 'concluida' AND data >= datetime('now', '-30 days')
-      GROUP BY COALESCE(NULLIF(TRIM(pagamento), ''), 'Pendente')
-      ORDER BY receita DESC
-    `);
-
-    const totalReceitaPagtos = pagamentosRows.reduce((s, p) => s + Number(p.receita), 0);
-    const pagamentos = pagamentosRows.map(p => {
-      const receita = Number(p.receita);
-      return {
-        forma_pagamento: String(p.forma_pagamento),
-        lavagens: Number(p.lavagens),
-        receita,
-        // pct da receita no período — usado no gráfico de distribuição
-        pct_receita: totalReceitaPagtos > 0 ? Number(((receita / totalReceitaPagtos) * 100).toFixed(1)) : 0,
-      };
-    });
-
-    // 6. [B2] Desempenho por Operador (30 dias) — lavagens, receita e ticket
-    // médio por quem executou. lavagens.user_id sempre foi gravado; este é o
-    // primeiro consumo real desse dado para gestão de equipe.
-    const desempenhoOperadores = await all(`
-      SELECT 
-        u.id,
-        u.nome,
-        COUNT(l.id) as total_lavagens,
-        COALESCE(SUM(l.valor), 0) as receita,
-        ROUND(COALESCE(SUM(l.valor), 0) / NULLIF(COUNT(l.id), 0), 2) as ticket_medio
-      FROM users u
-      LEFT JOIN lavagens l 
-        ON l.user_id = u.id 
-        AND l.status = 'concluida' 
-        AND l.data >= datetime('now', '-30 days')
-      WHERE u.role = 'operador'
-      GROUP BY u.id, u.nome
-      ORDER BY receita DESC
-    `);
-
-    // 7. [B3] Tempo Médio de Atendimento — data_conclusao nunca era lido por
-    // nenhuma consulta; agora vira o indicador "min / lavagem" do dashboard.
-    const tempoAtendimentoRow = await get(`
-      SELECT 
-        COUNT(*) as total_finalizadas,
-        COALESCE(ROUND(AVG((julianday(data_conclusao) - julianday(data)) * 24 * 60), 1), 0) as tempo_medio_min
-      FROM lavagens
-      WHERE status = 'concluida' 
-        AND data_conclusao IS NOT NULL 
-        AND data IS NOT NULL
-    `);
-
-    // 8. Insumos em Estado Crítico com Cálculo do Runway
-    const produtosCriticos = await all(`
-      WITH consumo_recente AS (
-        SELECT 
-          produto_id,
-          COALESCE(SUM(quantidade), 0) as total_saida,
-          COUNT(DISTINCT substr(data, 1, 10)) as dias_registrados
-        FROM movimentacoes
-        WHERE tipo = 'saida' AND data >= datetime('now', '-30 days')
-        GROUP BY produto_id
-      )
-      SELECT 
-        p.id,
-        p.nome,
-        p.quantidade,
-        p.estoque_minimo,
-        p.unidade,
-        p.preco_unitario,
-        COALESCE(c.total_saida, 0) as total_saida_30d
-      FROM produtos p
-      LEFT JOIN consumo_recente c ON c.produto_id = p.id
-      WHERE p.quantidade <= p.estoque_minimo
-      ORDER BY p.quantidade ASC
-    `);
-
-    const estoqueCritico = produtosCriticos.map(p => {
-      const qtd = Number(p.quantidade);
-      const estoqueMin = Number(p.estoque_minimo);
-      const saida30d = Number(p.total_saida_30d);
-      const consumoDiario = Number((saida30d / 30.0).toFixed(2));
-      
-      let diasRestantes = null;
-      let statusPrevisao = 'alerta';
-
-      if (qtd <= 0) {
-        diasRestantes = 0;
-        statusPrevisao = 'zerado';
-      } else if (consumoDiario > 0) {
-        diasRestantes = Math.floor(qtd / consumoDiario);
-        if (diasRestantes <= 3) statusPrevisao = 'urgente';
-        else if (diasRestantes <= 7) statusPrevisao = 'atencao';
-        else statusPrevisao = 'moderado';
-      } else {
-        statusPrevisao = 'repor';
-      }
-
-      return {
-        id: p.id,
-        nome: p.nome,
-        quantidade: qtd,
-        estoque_minimo: estoqueMin,
-        unidade: p.unidade,
-        consumo_diario: consumoDiario,
-        dias_restantes: diasRestantes,
-        status_previsao: statusPrevisao
-      };
-    });
+    const estoqueCritico = produtosCriticosRows.map((p) => ({
+      id: p.id,
+      nome: p.nome,
+      quantidade: p.quantidade,
+      estoque_minimo: p.estoque_minimo,
+      unidade: p.unidade,
+      consumo_diario: 0,
+      dias_restantes: null,
+      status_previsao: p.quantidade === 0 ? "zerado" : "urgente",
+    }));
 
     res.json({
       financeiro: {
@@ -1075,384 +810,22 @@ app.get('/api/dashboard/stats', async (req, res) => {
         lavagens_semana_anterior: lavagensSemanaAnterior,
         variacao_receita_pct: variacaoReceitaPct,
         variacao_ticket_pct: variacaoTicketPct,
-        fluxo_diario_7d: fluxoDiario7d
+        fluxo_diario_7d: fluxoDiario7d,
       },
       fidelizacao: {
         total_clientes_com_lavagem: totalClientesComLavagem,
         clientes_recorrentes: clientesRecorrentes,
-        taxa_recorrencia_pct: taxaRecorrenciaPct
+        taxa_recorrencia_pct: taxaRecorrenciaPct,
       },
       clientes_ausentes: clientesAusentes,
-      mix_servicos: mixServicos,
       estoque_critico: estoqueCritico,
-      pagamentos,
-      desempenho_operadores: desempenhoOperadores.map(op => ({
-        id: op.id,
-        nome: op.nome,
-        total_lavagens: Number(op.total_lavagens),
-        receita: Number(op.receita),
-        ticket_medio: Number(op.ticket_medio),
-      })),
-      tempo_atendimento: {
-        total_finalizadas: Number(tempoAtendimentoRow?.total_finalizadas || 0),
-        tempo_medio_min: Number(tempoAtendimentoRow?.tempo_medio_min || 0),
-      }
     });
   } catch (err) {
     handleServerError(res, err);
   }
-});
-
-// ==========================================
-// BACKUP & RESET API
-// ==========================================
-// Allowlist de colunas por tabela, usada para validar o cabeçalho do CSV
-// antes de montar a query de import (evita SQL Injection via nome de coluna).
-const TABLE_COLUMNS = {
-  users: ['id', 'email', 'nome', 'password_hash', 'role', 'created_at'],
-  clientes: ['id', 'user_id', 'nome', 'telefone', 'created_at'],
-  veiculos: ['id', 'cliente_id', 'user_id', 'modelo', 'placa', 'cor', 'marca', 'created_at'],
-  tipos_lavagem: ['id', 'nome', 'descricao', 'preco', 'created_at'],
-  lavagens: ['id', 'cliente_id', 'veiculo_id', 'tipo_lavagem_id', 'status', 'valor', 'data', 'user_id', 'pagamento', 'observacao', 'data_conclusao'],
-  produtos: ['id', 'nome', 'quantidade', 'estoque_minimo', 'categoria', 'unidade', 'preco_unitario', 'user_id', 'created_at'],
-  movimentacoes: ['id', 'produto_id', 'tipo', 'quantidade', 'observacao', 'user_id', 'data'],
-  auditoria_lavagens: ['id', 'lavagem_id', 'user_id', 'campo', 'valor_anterior', 'valor_novo', 'data'],
-};
-
-// Colunas que podem SAIR do servidor. password_hash é deliberadamente omitido:
-// um backup circula por Downloads, e-mail e pendrive, e hashes bcrypt em mãos
-// de um atacante permitem cracking offline ilimitado.
-const EXPORT_COLUMNS = {
-  ...TABLE_COLUMNS,
-  users: ['id', 'email', 'nome', 'role', 'created_at'],
-};
-
-// Colunas que podem ENTRAR via CSV. password_hash também é omitido: aceitar um
-// hash arbitrário do arquivo permitiria injetar credenciais conhecidas pelo
-// atacante. Usuários restaurados recebem senha temporária aleatória.
-const IMPORT_COLUMNS = {
-  ...TABLE_COLUMNS,
-  users: ['id', 'email', 'nome', 'role', 'created_at'],
-};
-
-// Validação de domínio do CSV (FA-18). Antes, a única barreira era o CHECK do
-// SQLite: um `role` ou `status` inválido estourava como exceção do driver e
-// chegava ao admin como "Erro interno do servidor" 500, sem dizer qual linha do
-// arquivo estava errada. Validar aqui devolve 400 apontando linha e coluna, com
-// o mesmo rollback transacional de antes.
-const naoNegativo = (valor) => {
-  const n = Number(valor);
-  return Number.isFinite(n) && n >= 0;
-};
-
-const naoVazio = (valor) => valor !== null && valor !== undefined && String(valor).trim() !== '';
-
-// Por tabela: { coluna: [predicado, mensagem de erro] }. Colunas ausentes no
-// CSV são ignoradas (o import aceita subconjuntos de colunas); colunas
-// obrigatórias estão em COLUNAS_OBRIGATORIAS_IMPORT.
-const REGRAS_IMPORT = {
-  users: {
-    email: [(v) => RE_EMAIL.test(String(v || '')), 'e-mail inválido'],
-    role: [(v) => ROLES_VALIDOS.includes(v), `deve ser um de: ${ROLES_VALIDOS.join(', ')}`],
-  },
-  tipos_lavagem: {
-    preco: [naoNegativo, 'deve ser um número maior ou igual a zero'],
-  },
-  lavagens: {
-    status: [(v) => STATUS_LAVAGEM.includes(v), `deve ser um de: ${STATUS_LAVAGEM.join(', ')}`],
-    valor: [naoNegativo, 'deve ser um número maior ou igual a zero'],
-    data: [naoVazio, 'é obrigatória'],
-  },
-  produtos: {
-    quantidade: [naoNegativo, 'deve ser um número maior ou igual a zero'],
-    estoque_minimo: [naoNegativo, 'deve ser um número maior ou igual a zero'],
-    preco_unitario: [naoNegativo, 'deve ser um número maior ou igual a zero'],
-  },
-  movimentacoes: {
-    tipo: [(v) => TIPOS_MOVIMENTACAO.includes(v), `deve ser um de: ${TIPOS_MOVIMENTACAO.join(', ')}`],
-    quantidade: [naoNegativo, 'deve ser um número maior ou igual a zero'],
-  },
-  auditoria_lavagens: {
-    campo: [naoVazio, 'é obrigatório'],
-  },
-};
-
-// `id` é chave primária em todas as tabelas: vazio viraria NULL e o INSERT
-// falharia com a mensagem crua do SQLite.
-const COLUNAS_OBRIGATORIAS_IMPORT = {
-  users: ['id', 'email', 'nome', 'role'],
-  clientes: ['id', 'nome'],
-  veiculos: ['id', 'cliente_id', 'modelo', 'placa'],
-  tipos_lavagem: ['id', 'nome', 'preco'],
-  lavagens: ['id', 'cliente_id', 'veiculo_id', 'tipo_lavagem_id', 'status', 'valor', 'data'],
-  produtos: ['id', 'nome'],
-  movimentacoes: ['id', 'produto_id', 'tipo', 'quantidade'],
-  auditoria_lavagens: ['id', 'lavagem_id', 'campo'],
-};
-
-/**
- * Valida um CSV já parseado. Lança ValidacaoError (400) na primeira linha
- * problemática, citando tabela, linha e coluna. A linha informada é a do
- * arquivo: índice 0 do array = linha 2, porque a linha 1 é o cabeçalho.
- */
-function validarDominioImport(table, records, colunas) {
-  const obrigatorias = (COLUNAS_OBRIGATORIAS_IMPORT[table] || []).filter(c => colunas.includes(c));
-  const regras = REGRAS_IMPORT[table] || {};
-
-  records.forEach((record, i) => {
-    const linha = i + 2;
-
-    for (const coluna of obrigatorias) {
-      if (!naoVazio(record[coluna])) {
-        throw new ValidacaoError(
-          `${table}.csv, linha ${linha}, coluna "${coluna}": valor obrigatório está vazio. Nenhum dado foi importado.`
-        );
-      }
-    }
-
-    for (const [coluna, [valida, mensagem]] of Object.entries(regras)) {
-      if (!colunas.includes(coluna)) continue;
-      const valor = record[coluna];
-      // Coluna opcional em branco continua sendo aceita como NULL; só o que foi
-      // preenchido precisa respeitar o domínio.
-      if (!naoVazio(valor) && !obrigatorias.includes(coluna)) continue;
-      if (!valida(valor)) {
-        throw new ValidacaoError(
-          `${table}.csv, linha ${linha}, coluna "${coluna}": ${mensagem} (recebido: "${valor}"). Nenhum dado foi importado.`
-        );
-      }
-    }
-  });
-}
-
-app.get('/api/backup/export', requireAdmin, async (req, res) => {
-  try {
-    const backup = {};
-    for (const table of tables) {
-      const colunas = EXPORT_COLUMNS[table].join(', ');
-      const rows = await all(`SELECT ${colunas} FROM ${table}`);
-      backup[table] = stringify(rows, {
-        header: true,
-        cast: { string: sanitizeCsvCell },
-      });
-    }
-    res.json(backup);
-  } catch (err) {
-    handleServerError(res, err);
-  }
-});
-
-app.post('/api/backup/import', requireAdmin, upload.any(), async (req, res) => {
-  try {
-    const files = req.files;
-    if (!files || files.length === 0) {
-      return res.status(400).json({ error: 'Nenhum arquivo enviado.' });
-    }
-
-    // Identificar tabelas pelos nomes dos arquivos (o fileFilter do multer já
-    // rejeitou qualquer nome fora da allowlist antes de chegar aqui).
-    const dataToImport = {};
-    for (const file of files) {
-      // name e.g. "clientes.csv"
-      const tableName = path.basename(file.originalname, path.extname(file.originalname));
-      if (tables.includes(tableName)) {
-        const records = parse(file.buffer, { columns: true, skip_empty_lines: true });
-        dataToImport[tableName] = records;
-      }
-    }
-
-    let importedCount = 0;
-    const senhasTemporarias = [];
-
-    // Serializado junto das movimentações e do reset: todos abrem transação na
-    // mesma conexão SQLite e não podem se sobrepor.
-    await emTransacaoSerializada(async () => {
-    await exec('PRAGMA foreign_keys = OFF;');
-    await exec('BEGIN TRANSACTION;');
-
-    try {
-      // Ordem de dependência. auditoria_lavagens vem logo após lavagens:
-      // suas linhas referenciam lavagens(id), e a ordem decide se o
-      // foreign_key_check do fim do fluxo passa ou derruba o import inteiro.
-      const order = ['users', 'clientes', 'veiculos', 'tipos_lavagem', 'produtos', 'lavagens', 'auditoria_lavagens', 'movimentacoes'];
-      
-      // Limpar tabelas que estão sendo importadas
-      for (const table of order) {
-        if (dataToImport[table]) {
-          await exec(`DELETE FROM ${table};`);
-        }
-      }
-
-      for (const table of order) {
-        const records = dataToImport[table];
-        if (!records || records.length === 0) continue;
-
-        const columns = Object.keys(records[0]);
-        const colunasInvalidas = columns.filter(c => !IMPORT_COLUMNS[table].includes(c));
-        if (colunasInvalidas.length > 0) {
-          throw new ValidacaoError(
-            `Colunas inválidas em ${table}.csv: ${colunasInvalidas.join(', ')}. ` +
-            `Permitidas: ${IMPORT_COLUMNS[table].join(', ')}`
-          );
-        }
-
-        validarDominioImport(table, records, columns);
-
-        // Usuários restaurados nunca trazem hash do arquivo: cada um recebe uma
-        // senha temporária aleatória, devolvida ao admin na resposta para que
-        // ele a entregue ao usuário.
-        const colunasInsert = table === 'users' ? [...columns, 'password_hash'] : columns;
-        const placeholders = colunasInsert.map(() => '?').join(', ');
-        const sql = `INSERT INTO ${table} (${colunasInsert.join(', ')}) VALUES (${placeholders})`;
-
-        for (const record of records) {
-          const values = columns.map(col => record[col] === '' ? null : record[col]);
-
-          if (table === 'users') {
-            const senhaTemporaria = crypto.randomBytes(9).toString('base64url');
-            senhasTemporarias.push({ email: record.email, senha_temporaria: senhaTemporaria });
-            values.push(await bcrypt.hash(senhaTemporaria, 10));
-          }
-
-          await run(sql, values);
-          importedCount++;
-        }
-      }
-
-      // Com as FKs desligadas o SQLite aceitaria referências órfãs (ex: uma
-      // lavagem apontando para um cliente que não veio no backup). Esta
-      // verificação acontece com a transação ainda aberta, então um backup
-      // inconsistente é rejeitado por inteiro em vez de corromper o banco.
-      const problemasFk = await all('PRAGMA foreign_key_check;');
-      if (problemasFk.length > 0) {
-        const tabelasAfetadas = [...new Set(problemasFk.map(p => p.table))].join(', ');
-        throw new ValidacaoError(
-          `Backup inconsistente: ${problemasFk.length} referência(s) órfã(s) em ${tabelasAfetadas}. ` +
-          'Nenhum dado foi importado.'
-        );
-      }
-
-      await exec('COMMIT;');
-    } catch (e) {
-      await exec('ROLLBACK;').catch(() => {});
-      throw e;
-    } finally {
-      // Reativa as FKs sempre fora da transação, senão o PRAGMA é no-op.
-      await exec('PRAGMA foreign_keys = ON;').catch(() => {});
-    }
-    });
-
-    res.json({
-      success: true,
-      records: importedCount,
-      warnings: [],
-      senhas_temporarias: senhasTemporarias,
-    });
-  } catch (err) {
-    responderErro(res, err);
-  }
-});
-
-app.post('/api/backup/reset', requireAdmin, async (req, res) => {
-  try {
-    // Serializado junto das movimentações: as duas abrem transação na mesma
-    // conexão SQLite e não podem se sobrepor.
-    await emTransacaoSerializada(async () => {
-      await exec('PRAGMA foreign_keys = OFF;');
-      try {
-        await exec('BEGIN TRANSACTION;');
-        try {
-          // auditoria_lavagens não tem mais FK para lavagens (a trilha de
-          // exclusão precisa sobreviver ao DELETE), então ela nunca é limpa
-          // por cascade: precisa ser apagada explicitamente junto com as
-          // demais, senão o reset deixaria linhas órfãs para trás.
-          for (const table of tables) {
-            await exec(`DELETE FROM ${table};`);
-          }
-          await exec('COMMIT;');
-        } catch (e) {
-          await exec('ROLLBACK;').catch(() => {});
-          throw e;
-        }
-      } finally {
-        // Reativa as FKs sempre fora da transação, senão o PRAGMA é no-op.
-        await exec('PRAGMA foreign_keys = ON;').catch(() => {});
-      }
-    });
-    res.json({ success: true });
-  } catch (err) {
-    responderErro(res, err);
-  }
-});
-
-// ==========================================
-// ERROR HANDLER GLOBAL
-// Registrado depois de todas as rotas. Converte erros de upload, CORS e
-// validação em respostas limpas, e qualquer outra exceção em 500 genérico —
-// nunca um stack trace do Express para o cliente.
-// ==========================================
-app.use((err, req, res, next) => {
-  if (!err) return next();
-  if (res.headersSent) return next(err);
-
-  if (err instanceof multer.MulterError) {
-    console.error('Upload rejeitado:', err.code, err.message);
-    const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
-    const mensagem = err.code === 'LIMIT_FILE_SIZE'
-      ? 'Arquivo de backup muito grande. O limite é 5 MB por CSV.'
-      : 'Upload inválido. Envie apenas os arquivos CSV gerados pelo export.';
-    return res.status(status).json({ error: mensagem });
-  }
-
-  // Corpo JSON acima do limite de 200kb (lançado pelo body-parser).
-  if (err.type === 'entity.too.large') {
-    return res.status(413).json({ error: 'Corpo da requisição muito grande.' });
-  }
-  if (err instanceof SyntaxError && 'body' in err) {
-    return res.status(400).json({ error: 'JSON inválido no corpo da requisição.' });
-  }
-
-  if (err.status && err.clientMessage) {
-    if (err instanceof CorsError) console.warn(err.message);
-    return res.status(err.status).json({ error: err.clientMessage });
-  }
-
-  return handleServerError(res, err);
 });
 
 const PORT = process.env.PORT || 3001;
-
-// Inicia o servidor se não estiver sendo executado como Serverless Function (ex: Vercel)
-//
-// O listen espera o dbReady: as rotas fazem INSERT em tabelas que só existem
-// depois que o schema roda (ex: auditoria_lavagens). Sem esta espera, subir a
-// porta em paralelo com a aplicação do schema abria uma janela em que o
-// primeiro PUT de lavagem respondia 500 com "no such table".
-if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
-  dbReady.then(() => {
-    // Credenciais de bootstrap publicadas na documentação são avisadas no boot,
-    // não só no seed: quem sobe o servidor é quem precisa ver o alerta (FA-17).
-    avisarSenhasSeedPadrao();
-    app.listen(PORT, () => {
-      console.log(`Backend SQLite rodando na porta ${PORT}`);
-    });
-  }).catch((err) => {
-    console.error('Servidor não iniciado: banco de dados indisponível.', err);
-    process.exit(1);
-  });
-}
-
-// Compatibilidade CommonJS e ES Modules para Vercel Serverless Function.
-// O try/catch é necessário porque ferramentas que transformam ESM (o Vitest,
-// por exemplo) também definem `module`, mas com `default` somente-leitura —
-// atribuir ali lançava TypeError e impedia importar o app nos testes.
-try {
-  if (typeof module !== 'undefined' && module.exports) {
-    module.exports = app;
-  }
-} catch {
-  // Ambiente ESM puro: `export default` abaixo já cobre o caso.
-}
-
-export { app };
-export default app;
+app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+});
