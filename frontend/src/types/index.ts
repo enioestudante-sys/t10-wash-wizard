@@ -1,11 +1,12 @@
 export interface Cliente {
   id: string;
   nome: string;
-  telefone: string;
-  user_id: string;
-  created_at: string;
+  telefone?: string | null;
+  email?: string | null;
+  data_nascimento?: string | null;
+  user_id?: string;
+  created_at?: string;
   updated_at?: string;
-
 }
 
 export interface Veiculo {
@@ -13,17 +14,20 @@ export interface Veiculo {
   cliente_id: string;
   modelo: string;
   placa: string;
-  cor: string;
-  user_id: string;
+  marca?: string | null;
+  cor?: string | null;
+  user_id?: string;
+  created_at?: string;
   updated_at?: string;
-
 }
 
 export interface TipoLavagem {
   id: string;
   nome: string;
-  descricao: string;
+  descricao?: string | null;
   preco: number;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface Lavagem {
@@ -31,45 +35,50 @@ export interface Lavagem {
   cliente_id: string;
   veiculo_id: string;
   tipo_lavagem_id: string;
-  status: 'pendente' | 'em_progresso' | 'concluida' | 'cancelada';
-  pagamento: string;
+  status: "pendente" | "em_progresso" | "concluida" | "cancelada";
+  pagamento?: string | null;
   valor: number;
-  observacao: string;
-  user_id: string;
-  data: string;
-  data_conclusao: string | null;
+  observacao?: string | null;
+  user_id?: string;
+  data?: string;
+  data_conclusao?: string | null;
+  created_at?: string;
   updated_at?: string;
-
 }
 
 export interface Produto {
   id: string;
   nome: string;
-  categoria: 'Limpeza' | 'Polimento' | 'Proteção' | 'Outros';
+  categoria: "Limpeza" | "Polimento" | "Proteção" | "Outros" | string;
   quantidade: number;
   estoque_minimo: number;
   unidade: string;
-  preco_unitario: number;
-  user_id: string;
+  preco_unitario?: number;
+  user_id?: string;
+  created_at?: string;
   updated_at?: string;
-
 }
 
 export interface MovimentacaoEstoque {
   id: string;
   produto_id: string;
-  tipo: 'entrada' | 'saida';
+  tipo: "entrada" | "saida";
   quantidade: number;
-  observacao: string;
-  user_id: string;
-  data: string;
+  observacao?: string | null;
+  user_id?: string;
+  data?: string;
+  created_at?: string;
   updated_at?: string;
-
 }
 
-export type SyncStatus = 'synced' | 'pending' | 'conflict';
+export type SyncStatus = "synced" | "pending" | "conflict";
 
-export type EntityType = 'cliente' | 'veiculo' | 'lavagem' | 'produto' | 'movimentacao';
+export type EntityType =
+  | "cliente"
+  | "veiculo"
+  | "lavagem"
+  | "produto"
+  | "movimentacao";
 
 export interface Conflict {
   entityType: EntityType;
@@ -127,7 +136,7 @@ export interface DashboardStats {
     unidade: string;
     consumo_diario: number;
     dias_restantes: number | null;
-    status_previsao: 'zerado' | 'urgente' | 'atencao' | 'moderado' | 'repor';
+    status_previsao: "zerado" | "urgente" | "atencao" | "moderado" | "repor";
   }>;
   pagamentos: Array<{
     forma_pagamento: string;

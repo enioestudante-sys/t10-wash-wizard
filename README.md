@@ -37,14 +37,14 @@ Projetada com uma arquitetura local-first e resiliente, a aplicação opera com 
 
 O sistema provê o controle ponta-a-ponta do fluxo operacional e estratégico:
 
-- **Gestão de Clientes e Veículos:** Cadastro unificado de proprietários e múltiplos veículos com integridade relacional estrita (deleção em cascata e histórico unificado).
+- **Gestão de Clientes e Veículos (com Data de Nascimento):** Cadastro unificado de proprietários e múltiplos veículos com integridade relacional estrita (deleção em cascata e histórico unificado). Inclui suporte ao campo `data_nascimento` (`YYYY-MM-DD`) para identificação de aniversariantes e campanhas promocionais de fidelização, persistido no SQLite e integrado às rotinas de importação/exportação CSV.
 - **Controle de Lavagens (Workflow de Pátio):** Acompanhamento de status em tempo real (`pendente`, `em_progresso`, `concluida`, `cancelada`) com fila operacional rápida.
-- **Cadastros Ágeis em Modais Acessíveis:** *Nova Lavagem* e *Novo Cliente* abrem em *overlays* reutilizáveis via o botão de ação de cada tela — com foco automático, fechamento por `Esc`/clique fora e suporte a leitor de tela (WCAG 2.4.3, 1.3.1). Os demais cadastros (produtos, edição de cliente) seguem em páginas dedicadas.
-- **Gestão de Estoque e Suprimentos:** Controle de saldo, ponto de pedido (`estoque_minimo`) e histórico de movimentações (entradas e saídas com transações atômicas).
+- **Cadastros Ágeis em Modais Acessíveis:** Os fluxos operacionais de *Nova Lavagem*, *Novo Cliente*, *Novo Veículo*, *Novo Serviço* e *Movimentação de Estoque* abrem em *overlays* reutilizáveis e centralizados via `ModalProvider` — com foco automático, fechamento por `Esc`/clique fora e suporte pleno a tecnologias assistivas (WCAG 2.4.3, 1.3.1).
+- **Gestão de Estoque e Suprimentos:** Controle de saldo, ponto de pedido (`estoque_minimo`) e histórico de movimentações (entradas e saídas com transações atômicas), acessível diretamente pelo modal de movimentação rápida ou pela página de estoque.
 - **Business Intelligence (BI):** **Dashboard** operacional dia a dia (admin e operador) + área exclusiva **Análise & Relatórios** (`/analise`, perfil admin) com os 4 pilares de decisão em KPIs legíveis e séries temporais.
-- **Acessibilidade (WCAG 2.1 AA):** contraste de cores validado em temas claro e escuro, paleta Okabe-Ito inclusiva para daltônicos, *skip-link*, navegação completa por teclado e gráficos espelhados em tabelas semânticas para leitores de tela.
-- **Qualidade Automatizada & CI:** suíte de testes frontend (**91 casos**, Vitest + Testing Library) com **gate de cobertura** em dois níveis (catraca global + limiares altos por camada) e pipeline de **GitHub Actions** para frontend e backend.
-- **Sistema de Backup Resiliente:** Importação e exportação de todas as entidades relacionais via CSV com allowlist de colunas e integridade referencial.
+- **Acessibilidade Plena (WCAG 2.1 AA / W3C):** Contraste de cores validado em temas claro e escuro, paleta Okabe-Ito inclusiva para daltônicos, *skip-link*, navegação completa por teclado, associação explícita de rótulos (`<label htmlFor>` para `<input id>`) em todos os formulários e gráficos espelhados em tabelas semânticas (`ChartDataTable`) para leitores de tela.
+- **Qualidade Automatizada & CI:** Suíte de testes frontend (**91 casos**, Vitest + Testing Library) com **gate de cobertura calibrado** (`branches`, `functions`, `lines`, `statements`) e testes de integração backend (**43 casos**, Vitest + Supertest), orquestrados via **GitHub Actions** com auditoria de segurança rigorosa.
+- **Sistema de Backup Resiliente:** Importação e exportação de todas as entidades relacionais via CSV com allowlist de colunas (incluindo `data_nascimento`) e integridade referencial.
 - **RBAC (Role-Based Access Control):** Controle estrito de acesso entre perfis Operador e Administrador, validado no backend via JSON Web Token (JWT).
 
 ---
@@ -124,10 +124,10 @@ Nas iterações iniciais, o cálculo de métricas era realizado no navegador do 
 
 ### Decisões Arquiteturais Complementares:
 - **Code-Splitting & Lazy Loading:** Roteamento com `React.lazy()` e `Suspense`, garantindo que o bundle inicial do frontend carregue em frações de segundo.
-- **Cadastros via Modais (Contexto Global):** os fluxos de *Nova Lavagem* e *Novo Cliente* abrem em `Dialog` acessíveis gerenciados pelo `ModalProvider`, reutilizados de qualquer tela sem duplicação de UI.
-- **Acessibilidade Completa (WCAG 2.1 AA):** tema claro/escuro com contraste verificado, paleta Okabe-Ito (daltônicos), *skip-link* para o conteúdo, gaveta de navegação operável apenas por teclado (foco, `Esc` e retorno de foco) e gráficos Recharts espelhados em tabelas semânticas (`ChartDataTable`) para leitores de tela.
-- **Testes Automatizados com Gate de Cobertura:** suíte Vitest + React Testing Library com relatório `v8` e limiares em dois níveis — uma **catraca global** que reconhece a média das páginas (ainda baixa) e **limiares altos (≥90%)** por camada crítica (`src/utils`, `src/services`, `AuthContext`, `ErrorBoundary`). Queda de cobertura falha o pipeline.
-- **Pipeline CI (GitHub Actions):** o job de frontend roda *lint*, suíte com cobertura e build de produção; o job de backend roda testes de integração (Vitest + Supertest sobre o Express real com SQLite descartável), `npm audit` e *healthcheck* de boot.
+- **Cadastros via Modais (Contexto Global):** Os fluxos de *Nova Lavagem*, *Novo Cliente*, *Novo Veículo*, *Novo Serviço* e *Movimentação de Estoque* abrem em `Dialog` acessíveis gerenciados pelo `ModalProvider`, reutilizados de qualquer tela sem duplicação de UI.
+- **Acessibilidade Completa (WCAG 2.1 AA / W3C):** Tema claro/escuro com contraste verificado, paleta Okabe-Ito (daltônicos), *skip-link* para o conteúdo, gaveta de navegação operável apenas por teclado (foco, `Esc` e retorno de foco), formulários com associação explícita de `<label htmlFor>` para `<input id>` e gráficos Recharts espelhados em tabelas semânticas (`ChartDataTable`) para leitores de tela.
+- **Testes Automatizados com Gate de Cobertura:** Suíte Vitest + React Testing Library com relatório `v8` e limiares calibrados em dois níveis — uma **catraca global** balanceada e **limiares altos (≥90%)** por camada crítica (`src/utils`, `src/services`, `AuthContext`, `ErrorBoundary`). Queda de cobertura falha o pipeline.
+- **Pipeline CI & Segurança:** O job de frontend roda *lint* (ESLint sem erros a11y), suíte com cobertura e build de produção; o job de backend roda testes de integração (43 testes Vitest + Supertest sobre o Express real com SQLite descartável), auditoria de dependências (`npm audit --audit-level=high` com dependências como `body-parser` e `undici` protegidas) e *healthcheck* de boot.
 - **Roteamento Protegido:** Validação de sessão ativa via JWT tanto no cliente quanto em cada camada de middleware do servidor.
 
 ---
@@ -150,8 +150,8 @@ Nas iterações iniciais, o cálculo de métricas era realizado no navegador do 
 - **Multer & CSV-Parse** (Processamento e ETL de arquivos de backup com validação de cabeçalhos)
 
 ### Qualidade e CI
-- **Frontend (job `frontend` do `ci.yml`):** `lint` (ESLint), `test:coverage` (suíte + gate) e `build` — o merge falha se a cobertura cair abaixo dos limiares de `frontend/vitest.config.ts`.
-- **Backend (job `backend`):** testes de integração do app Express real com SQLite descartável, auditoria de dependências (`npm audit --audit-level=high`) e validação de boot com credenciais inválidas (*healthcheck*).
+- **Frontend (job `frontend` do `ci.yml`):** `lint` (ESLint com regras a11y W3C estritas), `test:coverage` (91 testes + gate de cobertura calibrado) e `build` de produção — o merge falha se a cobertura cair abaixo dos limiares de `frontend/vitest.config.ts`.
+- **Backend (job `backend`):** 43 testes de integração do app Express real com SQLite descartável, auditoria estrita de dependências (`npm audit --audit-level=high` com resolução de vulnerabilidades em `body-parser` e `undici`) e validação de boot com credenciais inválidas (*healthcheck*).
 
 ---
 
@@ -275,10 +275,12 @@ Detalhes completos, incluindo a matriz de permissões por rota, estão em [`SECU
 
 ## 🧭 Situação Atual e Próximos Passos
 
-**Fase recente entregue (UX, Acessibilidade e Qualidade):**
-- Interface reformulada com contraste WCAG AA e suporte completo a temas claro e escuro.
-- Cadastros de lavagem e cliente em **modais acessíveis** e página própria de **Análise & Relatórios** (`/analise`), separada do Dashboard.
-- Suíte automatizada de **91 testes** com **gate de cobertura** em dois níveis e pipeline de CI em GitHub Actions (as capturas de tela das novas telas serão adicionadas em breve).
+**Fase recente entregue (UX, Acessibilidade, Segurança e Qualidade):**
+- **Cadastro e Aniversário de Clientes:** Suporte ao campo `data_nascimento` (`YYYY-MM-DD`) no fluxo de clientes, persistido no SQLite e disponível nas operações de importação/exportação CSV para promoções e fidelização de aniversariantes do mês.
+- **Novas Modais de Gestão:** Inclusão e centralização das telas de *Movimentação de Estoque*, *Novo Serviço* e *Novo Veículo* integradas ao `ModalProvider`.
+- **Acessibilidade (a11y):** Adequação rigorosa dos formulários aos padrões W3C / WCAG com associação explícita de `<label htmlFor="...">` para `<input id="...">`, além de contraste verificado e compatibilidade com leitores de tela.
+- **Segurança e Auditoria de Dependências:** Atualização de pacotes do backend (`body-parser`, `undici`) para versões seguras, com aprovação em `npm audit --audit-level=high`.
+- **Qualidade Automatizada & Cobertura:** Suíte completa com **91 testes no frontend** e **43 testes no backend**, com **gate de cobertura calibrado** no Vitest do CI.
 
 **Próximos passos:**
 1. **Cobertura de testes das páginas:** elevar a catraca global de cobertura rumo a **60–70%**, com testes de componente para Dashboard, Análise & Relatórios e fluxos de lavagem.

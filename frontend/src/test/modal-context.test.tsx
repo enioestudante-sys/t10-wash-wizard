@@ -9,6 +9,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { ModalProvider, useModal } from '@/contexts/ModalContext';
+import { AppProvider } from '@/contexts/AppContext';
 
 vi.mock('@/components/modals/NovaLavagemModal', () => ({
   NovaLavagemModal: ({ isOpen }: { isOpen: boolean }) =>
@@ -18,6 +19,33 @@ vi.mock('@/components/modals/NovaLavagemModal', () => ({
 vi.mock('@/components/modals/NovoClienteModal', () => ({
   NovoClienteModal: ({ isOpen }: { isOpen: boolean }) =>
     isOpen ? <div data-testid="modal-cliente">Novo Cliente</div> : null,
+}));
+
+vi.mock('@/components/modals/NovoVeiculoModal', () => ({
+  NovoVeiculoModal: ({ isOpen }: { isOpen: boolean }) =>
+    isOpen ? <div data-testid="modal-veiculo">Novo Veículo</div> : null,
+}));
+
+vi.mock('@/components/modals/NovoServicoModal', () => ({
+  NovoServicoModal: ({ isOpen }: { isOpen: boolean }) =>
+    isOpen ? <div data-testid="modal-servico">Novo Serviço</div> : null,
+}));
+
+vi.mock('@/components/modals/MovimentacaoEstoqueModal', () => ({
+  MovimentacaoEstoqueModal: ({ isOpen }: { isOpen: boolean }) =>
+    isOpen ? <div data-testid="modal-movimentacao">Movimentação</div> : null,
+}));
+
+vi.mock('@/contexts/AppContext', () => ({
+  useApp: () => ({
+    clientes: [],
+    veiculos: [],
+    tiposLavagem: [],
+    lavagens: [],
+    produtos: [],
+    movimentacoes: [],
+  }),
+  AppProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
 
 function BotoesDeDisparo() {
@@ -48,9 +76,11 @@ afterEach(() => {
 describe('ModalContext', () => {
   it('openNovaLavagem() abre o NovaLavagemModal', () => {
     render(
-      <ModalProvider>
-        <BotoesDeDisparo />
-      </ModalProvider>
+      <AppProvider>
+        <ModalProvider>
+          <BotoesDeDisparo />
+        </ModalProvider>
+      </AppProvider>
     );
 
     expect(screen.queryByTestId('modal-lavagem')).not.toBeInTheDocument();
@@ -60,9 +90,11 @@ describe('ModalContext', () => {
 
   it('openNovoCliente() abre o NovoClienteModal', () => {
     render(
-      <ModalProvider>
-        <BotoesDeDisparo />
-      </ModalProvider>
+      <AppProvider>
+        <ModalProvider>
+          <BotoesDeDisparo />
+        </ModalProvider>
+      </AppProvider>
     );
 
     expect(screen.queryByTestId('modal-cliente')).not.toBeInTheDocument();
@@ -72,9 +104,11 @@ describe('ModalContext', () => {
 
   it('fecha o modal ao chamar o close correspondente', () => {
     render(
-      <ModalProvider>
-        <BotoesDeDisparo />
-      </ModalProvider>
+      <AppProvider>
+        <ModalProvider>
+          <BotoesDeDisparo />
+        </ModalProvider>
+      </AppProvider>
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'abrir lavagem' }));

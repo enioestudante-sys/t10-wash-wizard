@@ -367,9 +367,10 @@ app.post('/api/clientes', async (req, res) => {
   try {
     const nome = textoObrigatorio(req.body.nome, 'Nome do cliente', 120);
     const telefone = telefoneOpcional(req.body.telefone);
+    const data_nascimento = req.body.data_nascimento ? String(req.body.data_nascimento).trim() : null;
     const id = genId();
     const created_at = now();
-    await run('INSERT INTO clientes (id, user_id, nome, telefone, created_at) VALUES (?, ?, ?, ?, ?)', [id, req.user.id, nome, telefone, created_at]);
+    await run('INSERT INTO clientes (id, user_id, nome, telefone, data_nascimento, created_at) VALUES (?, ?, ?, ?, ?, ?)', [id, req.user.id, nome, telefone, data_nascimento, created_at]);
     const row = await get('SELECT * FROM clientes WHERE id = ?', [id]);
     res.json(row);
   } catch (err) { responderErro(res, err); }
@@ -379,11 +380,16 @@ app.put('/api/clientes/:id', async (req, res) => {
   try {
     const nome = textoObrigatorio(req.body.nome, 'Nome do cliente', 120);
     const telefone = telefoneOpcional(req.body.telefone);
+    const data_nascimento = req.body.data_nascimento !== undefined
+      ? (req.body.data_nascimento ? String(req.body.data_nascimento).trim() : null)
+      : undefined;
 
-    const atual = await get('SELECT id FROM clientes WHERE id = ?', [req.params.id]);
+    const atual = await get('SELECT id, data_nascimento FROM clientes WHERE id = ?', [req.params.id]);
     if (!atual) return res.status(404).json({ error: 'Cliente não encontrado' });
 
-    await run('UPDATE clientes SET nome = ?, telefone = ? WHERE id = ?', [nome, telefone, req.params.id]);
+    const novaDataNascimento = data_nascimento !== undefined ? data_nascimento : atual.data_nascimento;
+
+    await run('UPDATE clientes SET nome = ?, telefone = ?, data_nascimento = ? WHERE id = ?', [nome, telefone, novaDataNascimento, req.params.id]);
     const row = await get('SELECT * FROM clientes WHERE id = ?', [req.params.id]);
     res.json(row);
   } catch (err) { responderErro(res, err); }
@@ -1110,7 +1116,7 @@ app.get('/api/dashboard/stats', async (req, res) => {
 // antes de montar a query de import (evita SQL Injection via nome de coluna).
 const TABLE_COLUMNS = {
   users: ['id', 'email', 'nome', 'password_hash', 'role', 'created_at'],
-  clientes: ['id', 'user_id', 'nome', 'telefone', 'created_at'],
+  clientes: ['id', 'user_id', 'nome', 'telefone', 'data_nascimento', 'created_at'],
   veiculos: ['id', 'cliente_id', 'user_id', 'modelo', 'placa', 'cor', 'marca', 'created_at'],
   tipos_lavagem: ['id', 'nome', 'descricao', 'preco', 'created_at'],
   lavagens: ['id', 'cliente_id', 'veiculo_id', 'tipo_lavagem_id', 'status', 'valor', 'data', 'user_id', 'pagamento', 'observacao', 'data_conclusao'],
