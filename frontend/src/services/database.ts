@@ -44,6 +44,7 @@ export interface Database {
 
   getMovimentacoes(userId: string): Promise<MovimentacaoEstoque[]>;
   createMovimentacao(userId: string, data: Omit<MovimentacaoEstoque, 'id' | 'data' | 'user_id'>): Promise<MovimentacaoEstoque>;
+  createMovimentacaoWithUpdate(userId: string, data: Omit<MovimentacaoEstoque, 'id' | 'data' | 'user_id'>): Promise<MovimentacaoEstoque>;
 }
 
 const req = async (endpoint: string, options: RequestInit & { notFoundReturnsNull?: boolean } = {}) => {

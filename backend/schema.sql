@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS clientes (
   user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
   nome TEXT NOT NULL,
   telefone TEXT,
+  data_nascimento TEXT, -- Adicionado para promoções de aniversário (formato YYYY-MM-DD)
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
