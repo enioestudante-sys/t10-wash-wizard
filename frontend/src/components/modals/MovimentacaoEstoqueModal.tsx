@@ -93,10 +93,14 @@ export function MovimentacaoEstoqueModal({
           {erro && <p className="text-destructive text-sm">{erro}</p>}
 
           <div>
-            <label className="block text-base font-semibold mb-1.5 text-foreground">
+            <label
+              htmlFor="movimentacao-produto"
+              className="block text-base font-semibold mb-1.5 text-foreground"
+            >
               Produto *
             </label>
             <select
+              id="movimentacao-produto"
               className="input-t10"
               value={selectedProdutoId}
               onChange={(e) => setSelectedProdutoId(e.target.value)}
@@ -113,10 +117,14 @@ export function MovimentacaoEstoqueModal({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-base font-semibold mb-1.5 text-foreground">
+              <label
+                htmlFor="movimentacao-tipo"
+                className="block text-base font-semibold mb-1.5 text-foreground"
+              >
                 Tipo de Operação
               </label>
               <select
+                id="movimentacao-tipo"
                 className="input-t10"
                 value={tipo}
                 onChange={(e) => setTipo(e.target.value as "entrada" | "saida")}
@@ -127,10 +135,14 @@ export function MovimentacaoEstoqueModal({
             </div>
 
             <div>
-              <label className="block text-base font-semibold mb-1.5 text-foreground">
+              <label
+                htmlFor="movimentacao-quantidade"
+                className="block text-base font-semibold mb-1.5 text-foreground"
+              >
                 Quantidade *
               </label>
               <input
+                id="movimentacao-quantidade"
                 type="number"
                 step="0.01"
                 min="0.01"
@@ -144,10 +156,14 @@ export function MovimentacaoEstoqueModal({
           </div>
 
           <div>
-            <label className="block text-base font-semibold mb-1.5 text-foreground">
+            <label
+              htmlFor="movimentacao-observacao"
+              className="block text-base font-semibold mb-1.5 text-foreground"
+            >
               Observação
             </label>
             <input
+              id="movimentacao-observacao"
               className="input-t10"
               value={observacao}
               onChange={(e) => setObservacao(e.target.value)}
