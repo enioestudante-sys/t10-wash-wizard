@@ -112,10 +112,14 @@ export function NovoVeiculoModal({
           {erro && <p className="text-destructive text-sm">{erro}</p>}
 
           <div>
-            <label className="block text-base font-semibold mb-1.5 text-foreground">
+            <label
+              htmlFor="veiculo-cliente"
+              className="block text-base font-semibold mb-1.5 text-foreground"
+            >
               Cliente *
             </label>
             <select
+              id="veiculo-cliente"
               className="input-t10"
               value={selectedClienteId}
               onChange={(e) => setSelectedClienteId(e.target.value)}
@@ -133,10 +137,14 @@ export function NovoVeiculoModal({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-base font-semibold mb-1.5 text-foreground">
+              <label
+                htmlFor="veiculo-modelo"
+                className="block text-base font-semibold mb-1.5 text-foreground"
+              >
                 Modelo *
               </label>
               <input
+                id="veiculo-modelo"
                 className="input-t10"
                 value={modelo}
                 onChange={(e) => setModelo(e.target.value)}
@@ -145,10 +153,14 @@ export function NovoVeiculoModal({
               />
             </div>
             <div>
-              <label className="block text-base font-semibold mb-1.5 text-foreground">
+              <label
+                htmlFor="veiculo-placa"
+                className="block text-base font-semibold mb-1.5 text-foreground"
+              >
                 Placa *
               </label>
               <input
+                id="veiculo-placa"
                 className="input-t10 uppercase"
                 value={placa}
                 onChange={(e) => setPlaca(e.target.value)}
@@ -160,10 +172,14 @@ export function NovoVeiculoModal({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-base font-semibold mb-1.5 text-foreground">
+              <label
+                htmlFor="veiculo-marca"
+                className="block text-base font-semibold mb-1.5 text-foreground"
+              >
                 Marca
               </label>
               <input
+                id="veiculo-marca"
                 className="input-t10"
                 value={marca}
                 onChange={(e) => setMarca(e.target.value)}
@@ -171,10 +187,14 @@ export function NovoVeiculoModal({
               />
             </div>
             <div>
-              <label className="block text-base font-semibold mb-1.5 text-foreground">
+              <label
+                htmlFor="veiculo-cor"
+                className="block text-base font-semibold mb-1.5 text-foreground"
+              >
                 Cor
               </label>
               <input
+                id="veiculo-cor"
                 className="input-t10"
                 value={cor}
                 onChange={(e) => setCor(e.target.value)}

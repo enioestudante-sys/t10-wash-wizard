@@ -104,10 +104,14 @@ export function NovoServicoModal({
           {erro && <p className="text-destructive text-sm">{erro}</p>}
 
           <div>
-            <label className="block text-base font-semibold mb-1.5 text-foreground">
+            <label
+              htmlFor="servico-nome"
+              className="block text-base font-semibold mb-1.5 text-foreground"
+            >
               Nome do Serviço *
             </label>
             <input
+              id="servico-nome"
               className="input-t10"
               value={nome}
               onChange={(e) => setNome(e.target.value)}
@@ -117,10 +121,14 @@ export function NovoServicoModal({
           </div>
 
           <div>
-            <label className="block text-base font-semibold mb-1.5 text-foreground">
+            <label
+              htmlFor="servico-preco"
+              className="block text-base font-semibold mb-1.5 text-foreground"
+            >
               Preço (R$) *
             </label>
             <input
+              id="servico-preco"
               type="number"
               step="0.01"
               min="0"
@@ -133,10 +141,14 @@ export function NovoServicoModal({
           </div>
 
           <div>
-            <label className="block text-base font-semibold mb-1.5 text-foreground">
+            <label
+              htmlFor="servico-descricao"
+              className="block text-base font-semibold mb-1.5 text-foreground"
+            >
               Descrição
             </label>
             <textarea
+              id="servico-descricao"
               className="input-t10 min-h-[80px] resize-y"
               value={descricao}
               onChange={(e) => setDescricao(e.target.value)}
